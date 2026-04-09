@@ -1,0 +1,10 @@
+data/
+hicreate
+hicreate.exe
+*.o
+*.obj
+*.out
+*.log
+*.user
+*.tmp
+.DS_Store
