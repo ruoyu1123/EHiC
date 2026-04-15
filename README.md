@@ -36,16 +36,19 @@ Outputs:
 ## Command Line
 
 ```text
-hicreate --reference ref.fa --matrix matrix.tsv --bin-size 1000 \
+hicreate --reference ref.fa [--matrix matrix.tsv] --bin-size 1000 \
          --read-length 150 --pairs 100000 --output-prefix sim \
          [--offset offset.tsv] [--enzyme-site AAGCTT] [--seed 42] \
-         [--insert-mean 150] [--insert-std 25] [--skip-art]
+         [--insert-mean 150] [--insert-std 25] [--skip-art] \
+         [--trans-ratio 0.10] [--synthetic-contacts 200000] \
+         [--cis-decay-alpha 1.0] [--max-cis-distance-bins 200] \
+         [--species-model generic_plant] [--arrangement-model auto] \
+         [--collision-randomness 0.35]
 ```
 
 Required arguments:
 
 - `--reference`: input reference FASTA
-- `--matrix`: input Hi-C matrix
 - `--bin-size`: genomic bin size used by the matrix
 - `--read-length`: read length for ART
 - `--pairs`: number of ligation products to sample
@@ -53,11 +56,19 @@ Required arguments:
 
 Optional arguments:
 
+- `--matrix`: input Hi-C matrix (if omitted, `hicreate` builds a synthetic matrix from the genome)
 - `--offset`: contig-to-global-bin mapping file
 - `--enzyme-site`: restriction enzyme motif, default `AAGCTT`
 - `--seed`: random seed
 - `--insert-mean`: ART insert mean
 - `--insert-std`: ART insert standard deviation
+- `--trans-ratio`: target fraction of trans-chromosomal interaction mass (default `0.10`)
+- `--synthetic-contacts`: number of sparse contacts used to build synthetic matrix (auto if omitted)
+- `--cis-decay-alpha`: cis distance-decay exponent (default `1.0`)
+- `--max-cis-distance-bins`: max cis bin separation for synthetic matrix (default `200`)
+- `--species-model`: synthetic matrix species preset (`generic_plant`, `arabidopsis`, `rice`, `maize`, `wheat`, `barley`)
+- `--arrangement-model`: chromosome arrangement override (`auto`, `territory`, `rabl`, `rosette`, `nonrabl`)
+- `--collision-randomness`: random collision baseline in trans sampling (0-1, default `0.35`)
 - `--skip-art`: only write ligation FASTA, do not call ART
 
 ## Input Files
@@ -128,7 +139,12 @@ If ART is enabled and installed:
 ## Simulation Notes
 
 - The simulation is driven by the input Hi-C matrix contact frequencies.
-- Fragment pairs are selected according to matrix weights, not an extra distance-decay model.
+- If `--matrix` is provided, matrix weights are rebalanced to match the requested `--trans-ratio`.
+- If `--matrix` is omitted, a sparse synthetic matrix is generated:
+  - cis contacts follow a power-law distance decay (`1/(distance+1)^alpha`)
+  - trans contacts are sampled across chromosomes according to `--trans-ratio`
+  - species-aware defaults include chromosome arrangement effects (`Rabl`, `Rosette`, or territory-like)
+  - random collision and chromosome arrangement are mixed via `--collision-randomness`
 - Restriction digestion is modeled explicitly from the reference sequence.
 - Common enzyme cut offsets are recognized for motifs such as HindIII and DpnII/MboI.
 - Ligation products include an explicit fill-in ligation junction.
