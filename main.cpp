@@ -5,16 +5,49 @@
 #include "simulator.h"
 #include <algorithm>
 #include <iostream>
+#include <unordered_map>
 #include <stdexcept>
 #include <string>
 
 namespace {
 
+double estimate_empirical_fraction(const std::vector<OffsetEntry> &source_offsets,
+                                   const std::vector<OffsetEntry> &target_offsets) {
+    if (target_offsets.empty()) {
+        return 0.0;
+    }
+    if (source_offsets.empty()) {
+        return 1.0;
+    }
+
+    std::unordered_map<std::string, std::size_t> target_bins_by_name;
+    std::size_t total_target_bins = 0;
+    for (const auto &offset : target_offsets) {
+        const std::size_t span = offset.end_bin > offset.start_bin ? offset.end_bin - offset.start_bin : 0;
+        target_bins_by_name[offset.contig] = span;
+        total_target_bins += span;
+    }
+    if (total_target_bins == 0) {
+        return 0.0;
+    }
+
+    std::size_t matched_bins = 0;
+    for (const auto &offset : source_offsets) {
+        const auto it = target_bins_by_name.find(offset.contig);
+        if (it != target_bins_by_name.end()) {
+            matched_bins += it->second;
+        }
+    }
+
+    const double fraction = static_cast<double>(matched_bins) / static_cast<double>(total_target_bins);
+    return std::max(0.0, std::min(1.0, fraction));
+}
+
 void print_usage() {
     std::cerr 
         << "Usage:\n"
         << "  hicreate --reference ref.fa [--matrix matrix.tsv] --bin-size 10000\n"
-        << "           --read-length 150 --pairs 100000 --output-prefix sim\n"
+        << "           [--read-length 150] [--pairs 100000] [--output-prefix sim]\n"
         << "           [--offset offsets.tsv] [--enzyme-site AAGCTT] [--skip-art]\n"
         << "           [--seed 123] [--insert-mean 150] [--insert-std 25]\n"
         << "           [--trans-ratio 0.10] [--synthetic-contacts 200000]\n"
@@ -86,9 +119,17 @@ Config parse_args(int argc, char **argv) {
         }
     }
 
-    if (cfg.reference_path.empty() || cfg.output_prefix.empty() || cfg.bin_size == 0 ||
-        cfg.read_length == 0 || cfg.pair_count == 0) {
+    if (cfg.reference_path.empty() || cfg.bin_size == 0) {
         throw std::runtime_error("Missing required arguments.");
+    }
+    if (cfg.output_prefix.empty()) {
+        throw std::runtime_error("--output-prefix must not be empty.");
+    }
+    if (cfg.read_length == 0) {
+        throw std::runtime_error("--read-length must be positive.");
+    }
+    if (cfg.pair_count == 0) {
+        throw std::runtime_error("--pairs must be positive.");
     }
     if (cfg.trans_ratio < 0.0 || cfg.trans_ratio > 1.0) {
         throw std::runtime_error("--trans-ratio must be within [0, 1].");
@@ -118,42 +159,56 @@ int main(int argc, char **argv) {
             throw std::runtime_error("Reference produced zero bins.");
         }
 
-        std::vector<OffsetEntry> offsets;
+        const std::vector<OffsetEntry> reference_offsets = build_reference_offsets(reference, cfg.bin_size);
+        std::vector<OffsetEntry> source_offsets;
         if (!cfg.offset_path.empty()) {
-            offsets = load_offsets(cfg.offset_path);
-        } else {
-            std::size_t start_bin = 0;
-            for (const auto &contig : reference.contigs) {
-                const std::size_t contig_bins = (contig.sequence.size() + cfg.bin_size - 1) / cfg.bin_size;
-                offsets.push_back(OffsetEntry{contig.name, start_bin, start_bin + contig_bins});
-                start_bin += contig_bins;
-            }
+            source_offsets = load_offsets(cfg.offset_path);
         }
 
         ContactMatrix matrix;
+        SyntheticModelOptions model_options;
+        model_options.trans_ratio = cfg.trans_ratio;
+        model_options.cis_decay_alpha = cfg.cis_decay_alpha;
+        model_options.max_cis_distance_bins = cfg.max_cis_distance_bins;
+        model_options.species_model = cfg.species_model;
+        model_options.arrangement_model = cfg.arrangement_model;
+        model_options.collision_randomness = cfg.collision_randomness;
+        model_options.seed = cfg.seed;
+
         if (!cfg.matrix_path.empty()) {
-            matrix = load_matrix(cfg.matrix_path, total_bins);
-            matrix = apply_trans_ratio(matrix, offsets, cfg.trans_ratio, cfg.seed);
+            const ContactMatrix source_matrix = load_matrix(cfg.matrix_path, 0);
+            const ContactMatrix remapped_matrix =
+                remap_matrix_to_reference(source_matrix, source_offsets, reference_offsets);
+            const double empirical_fraction = source_offsets.empty()
+                                                  ? 1.0
+                                                  : std::max(0.15, estimate_empirical_fraction(source_offsets, reference_offsets));
+
+            if (empirical_fraction < 0.999) {
+                std::size_t synthetic_contacts = cfg.synthetic_contact_count;
+                if (synthetic_contacts == 0) {
+                    synthetic_contacts = std::max<std::size_t>(
+                        20000, std::min<std::size_t>(2000000, source_matrix.contacts.size() * 8 + total_bins * 10));
+                }
+                const ContactMatrix synthetic_fill =
+                    generate_synthetic_matrix(total_bins, reference_offsets, synthetic_contacts, model_options);
+                matrix = blend_contact_matrices(remapped_matrix, synthetic_fill, empirical_fraction);
+            } else {
+                matrix = remapped_matrix;
+            }
+
+            matrix = apply_trans_ratio(matrix, reference_offsets, cfg.trans_ratio, cfg.seed);
         } else {
             std::size_t synthetic_contacts = cfg.synthetic_contact_count;
             if (synthetic_contacts == 0) {
                 synthetic_contacts = std::max<std::size_t>(
                     20000, std::min<std::size_t>(2000000, cfg.pair_count * 20));
             }
-            SyntheticModelOptions model_options;
-            model_options.trans_ratio = cfg.trans_ratio;
-            model_options.cis_decay_alpha = cfg.cis_decay_alpha;
-            model_options.max_cis_distance_bins = cfg.max_cis_distance_bins;
-            model_options.species_model = cfg.species_model;
-            model_options.arrangement_model = cfg.arrangement_model;
-            model_options.collision_randomness = cfg.collision_randomness;
-            model_options.seed = cfg.seed;
             matrix = generate_synthetic_matrix(total_bins,
-                                              offsets,
+                                              reference_offsets,
                                               synthetic_contacts,
                                               model_options);
         }
-        const auto ligation_products = create_ligation_products(cfg, reference, offsets, matrix);
+        const auto ligation_products = create_ligation_products(cfg, reference, reference_offsets, matrix);
         simulate_reads_with_artillumina(cfg, ligation_products);
 
         std::size_t total_library_bases = 0;

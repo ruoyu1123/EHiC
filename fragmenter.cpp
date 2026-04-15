@@ -108,10 +108,6 @@ std::vector<LigationProduct> create_ligation_products(const Config &cfg,
                                                       const ReferenceGenome &reference,
                                                       const std::vector<OffsetEntry> &offsets,
                                                       const ContactMatrix &matrix) {
-    if (offsets.size() != reference.contigs.size()) {
-        throw std::runtime_error("Offset row count must match the number of reference contigs.");
-    }
-
     std::unordered_map<std::string, std::size_t> contig_lookup;
     for (std::size_t i = 0; i < reference.contigs.size(); ++i) {
         contig_lookup.emplace(reference.contigs[i].name, i);
@@ -157,10 +153,17 @@ std::vector<LigationProduct> create_ligation_products(const Config &cfg,
 
     std::vector<double> weights;
     weights.reserve(matrix.contacts.size());
+    double total_weight = 0.0;
     for (const auto &contact : matrix.contacts) {
         const bool valid_bin1 = contact.bin1 < bin_to_fragments.size() && !bin_to_fragments[contact.bin1].empty();
         const bool valid_bin2 = contact.bin2 < bin_to_fragments.size() && !bin_to_fragments[contact.bin2].empty();
-        weights.push_back(valid_bin1 && valid_bin2 ? contact.weight : 0.0);
+        const double weight = valid_bin1 && valid_bin2 ? contact.weight : 0.0;
+        weights.push_back(weight);
+        total_weight += weight;
+    }
+
+    if (total_weight <= 0.0) {
+        throw std::runtime_error("Contact matrix does not overlap any valid reference bins.");
     }
 
     std::discrete_distribution<std::size_t> contact_dist(weights.begin(), weights.end());

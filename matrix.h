@@ -34,6 +34,9 @@ struct SyntheticModelOptions {
 
 std::vector<OffsetEntry> load_offsets(const std::string &path);
 ContactMatrix load_matrix(const std::string &path, std::size_t expected_bin_count);
+ContactMatrix remap_matrix_to_reference(const ContactMatrix &source_matrix,
+                                        const std::vector<OffsetEntry> &source_offsets,
+                                        const std::vector<OffsetEntry> &target_offsets);
 ContactMatrix generate_synthetic_matrix(std::size_t bin_count,
                                         const std::vector<OffsetEntry> &offsets,
                                         std::size_t synthetic_contact_count,
@@ -42,3 +45,6 @@ ContactMatrix apply_trans_ratio(const ContactMatrix &matrix,
                                 const std::vector<OffsetEntry> &offsets,
                                 double target_trans_ratio,
                                 std::uint64_t seed);
+ContactMatrix blend_contact_matrices(const ContactMatrix &primary,
+                                     const ContactMatrix &secondary,
+                                     double primary_fraction);

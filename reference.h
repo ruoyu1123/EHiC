@@ -4,6 +4,8 @@
 #include <string>
 #include <vector>
 
+#include "matrix.h"
+
 struct Contig {
     std::string name;
     std::string sequence;
@@ -17,3 +19,4 @@ struct ReferenceGenome {
 };
 
 ReferenceGenome load_reference_fasta(const std::string &path);
+std::vector<OffsetEntry> build_reference_offsets(const ReferenceGenome &reference, std::size_t bin_size);

@@ -5,8 +5,8 @@
 The current workflow is:
 
 1. Read a reference FASTA with one or more contigs.
-2. Read a Hi-C contact matrix in sparse or dense form.
-3. Read an optional offset file that maps global bins back to contigs.
+2. Read a Hi-C contact matrix in sparse or dense form, or build a synthetic one if no matrix is supplied.
+3. Read an optional offset file that maps matrix bins back to source contigs.
 4. Perform an in silico restriction digest.
 5. Sample fragment-fragment ligation events according to matrix contact frequencies.
 6. Write ligation products to FASTA.
@@ -37,7 +37,7 @@ Outputs:
 
 ```text
 hicreate --reference ref.fa [--matrix matrix.tsv] --bin-size 1000 \
-         --read-length 150 --pairs 100000 --output-prefix sim \
+         [--read-length 150] [--pairs 100000] [--output-prefix sim] \
          [--offset offset.tsv] [--enzyme-site AAGCTT] [--seed 42] \
          [--insert-mean 150] [--insert-std 25] [--skip-art] \
          [--trans-ratio 0.10] [--synthetic-contacts 200000] \
@@ -50,14 +50,14 @@ Required arguments:
 
 - `--reference`: input reference FASTA
 - `--bin-size`: genomic bin size used by the matrix
-- `--read-length`: read length for ART
-- `--pairs`: number of ligation products to sample
-- `--output-prefix`: prefix for output files
 
 Optional arguments:
 
 - `--matrix`: input Hi-C matrix (if omitted, `hicreate` builds a synthetic matrix from the genome)
 - `--offset`: contig-to-global-bin mapping file
+- `--read-length`: read length for ART, default `150`
+- `--pairs`: number of ligation products to sample, default `100000`
+- `--output-prefix`: prefix for output files, default `sim`
 - `--enzyme-site`: restriction enzyme motif, default `AAGCTT`
 - `--seed`: random seed
 - `--insert-mean`: ART insert mean
@@ -140,6 +140,8 @@ If ART is enabled and installed:
 
 - The simulation is driven by the input Hi-C matrix contact frequencies.
 - If `--matrix` is provided, matrix weights are rebalanced to match the requested `--trans-ratio`.
+- If `--matrix` and `--offset` do not perfectly match the target reference, contacts are remapped onto the target contigs by name and relative position, then missing signal is filled with a synthetic Hi-C background.
+- If `--matrix` is provided without `--offset`, the matrix is resized globally to the target genome bin count.
 - If `--matrix` is omitted, a sparse synthetic matrix is generated:
   - cis contacts follow a power-law distance decay (`1/(distance+1)^alpha`)
   - trans contacts are sampled across chromosomes according to `--trans-ratio`
@@ -149,6 +151,7 @@ If ART is enabled and installed:
 - Common enzyme cut offsets are recognized for motifs such as HindIII and DpnII/MboI.
 - Ligation products include an explicit fill-in ligation junction.
 - Each sampled ligation event is written as an independent FASTA record instead of concatenating everything into one sequence.
+- If `art_illumina` is unavailable, `hicreate` falls back to built-in paired FASTQ generation so reads are still produced.
 
 ## Included Example Data
 
