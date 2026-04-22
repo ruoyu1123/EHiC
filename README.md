@@ -1,6 +1,6 @@
 # hicreate
 
-`hicreate` is a small C++ command-line program for generating a simple Hi-C ligation library from a reference genome and a contact matrix.
+`hicreate` is a small C++ command-line program for generating 150 bp paired-end Hi-C reads from a reference genome and an optional contact matrix.
 
 The current workflow is:
 
@@ -9,8 +9,8 @@ The current workflow is:
 3. Read an optional offset file that maps matrix bins back to source contigs.
 4. Perform an in silico restriction digest.
 5. Sample fragment-fragment ligation events according to matrix contact frequencies.
-6. Write ligation products to FASTA.
-7. Optionally call `art_illumina` for read simulation.
+6. Build the two ends of each virtual ligation molecule from restriction-fragment coordinates.
+7. Write paired FASTQ files with built-in Illumina-like quality and substitution errors.
 
 ## Build
 
@@ -37,12 +37,12 @@ Outputs:
 
 ```text
 hicreate --reference ref.fa [--matrix matrix.tsv] --bin-size 1000 \
-         [--read-length 150] [--pairs 100000] [--output-prefix sim] \
+         [--coverage 30] [--pairs 100000] [--output-prefix sim] \
          [--offset offset.tsv] [--enzyme-site AAGCTT] [--seed 42] \
-         [--insert-mean 150] [--insert-std 25] [--skip-art] \
          [--trans-ratio 0.10] [--synthetic-contacts 200000] \
          [--cis-decay-alpha 1.0] [--max-cis-distance-bins 200] \
          [--species-model generic_plant] [--arrangement-model auto] \
+         [--trans-model auto] [--trans-hotspots 8] \
          [--collision-randomness 0.35]
 ```
 
@@ -55,21 +55,20 @@ Optional arguments:
 
 - `--matrix`: input Hi-C matrix (if omitted, `hicreate` builds a synthetic matrix from the genome)
 - `--offset`: contig-to-global-bin mapping file
-- `--read-length`: read length for ART, default `150`
-- `--pairs`: number of ligation products to sample, default `100000`
+- `--coverage`: target read depth over the reference genome; pairs are computed as `ceil(coverage * reference_bases / 300)`
+- `--pairs`: number of 150 bp paired-end read pairs to write, default `100000`
 - `--output-prefix`: prefix for output files, default `sim`
 - `--enzyme-site`: restriction enzyme motif, default `AAGCTT`
 - `--seed`: random seed
-- `--insert-mean`: ART insert mean
-- `--insert-std`: ART insert standard deviation
 - `--trans-ratio`: target fraction of trans-chromosomal interaction mass (default `0.10`)
 - `--synthetic-contacts`: number of sparse contacts used to build synthetic matrix (auto if omitted)
 - `--cis-decay-alpha`: cis distance-decay exponent (default `1.0`)
 - `--max-cis-distance-bins`: max cis bin separation for synthetic matrix (default `200`)
-- `--species-model`: synthetic matrix species preset (`generic_plant`, `arabidopsis`, `rice`, `maize`, `wheat`, `barley`)
+- `--species-model`: synthetic matrix species preset (`generic_plant`, `human`, `arabidopsis`, `rice`, `maize`, `wheat`, `barley`)
 - `--arrangement-model`: chromosome arrangement override (`auto`, `territory`, `rabl`, `rosette`, `nonrabl`)
+- `--trans-model`: trans interaction style (`auto`, `territory`, `random`, `telomere`, `compartment`, `hubs`)
+- `--trans-hotspots`: number of trans hub bins for `--trans-model hubs`, default `8`
 - `--collision-randomness`: random collision baseline in trans sampling (0-1, default `0.35`)
-- `--skip-art`: only write ligation FASTA, do not call ART
 
 ## Input Files
 
@@ -116,25 +115,25 @@ Windows:
 
 ```powershell
 .\hicreate.exe --reference data\ref.fa --matrix data\matrix.tsv --offset data\offset.tsv `
-  --bin-size 1000 --read-length 150 --pairs 1000 --output-prefix data\sim --skip-art
+  --bin-size 1000 --pairs 1000 --output-prefix data\sim
 ```
 
 Linux:
 
 ```bash
 ./hicreate --reference data/ref.fa --matrix data/matrix.tsv --offset data/offset.tsv \
-  --bin-size 1000 --read-length 150 --pairs 1000 --output-prefix data/sim --skip-art
+  --bin-size 1000 --pairs 1000 --output-prefix data/sim
 ```
 
 ## Output
 
 Main output:
 
-- `<prefix>_fragments.fa`: sampled ligation product library
+- `<prefix>_R1.fastq`: first reads
+- `<prefix>_R2.fastq`: second reads
 
-If ART is enabled and installed:
-
-- paired FASTQ files produced by `art_illumina`
+`--pairs` is the exact number of records written to each FASTQ file.
+If `--coverage` is provided, it replaces `--pairs` and computes the FASTQ record count from the reference size.
 
 ## Simulation Notes
 
@@ -145,13 +144,19 @@ If ART is enabled and installed:
 - If `--matrix` is omitted, a sparse synthetic matrix is generated:
   - cis contacts follow a power-law distance decay (`1/(distance+1)^alpha`)
   - trans contacts are sampled across chromosomes according to `--trans-ratio`
+  - `territory` trans contacts emphasize chromosome-size and nuclear-distance effects
+  - `random` trans contacts provide a uniform collision background
+  - `telomere` trans contacts enrich different-chromosome telomere/subtelomere bins
+  - `compartment` trans contacts enrich same synthetic A/B-like compartment bins across chromosomes
+  - `hubs` trans contacts create several point-like interchromosomal hot spots
   - species-aware defaults include chromosome arrangement effects (`Rabl`, `Rosette`, or territory-like)
   - random collision and chromosome arrangement are mixed via `--collision-randomness`
 - Restriction digestion is modeled explicitly from the reference sequence.
 - Common enzyme cut offsets are recognized for motifs such as HindIII and DpnII/MboI.
-- Ligation products include an explicit fill-in ligation junction.
-- Each sampled ligation event is written as an independent FASTA record instead of concatenating everything into one sequence.
-- If `art_illumina` is unavailable, `hicreate` falls back to built-in paired FASTQ generation so reads are still produced.
+- Ligation products include an explicit fill-in ligation junction, but the program does not materialize full ligation molecules per read pair.
+- For each sampled ligation event, only the required 150 bp prefixes/suffixes are sliced from the two restriction-fragment coordinates. This is equivalent to generating reads from the two ends of the virtual ligated sequence without copying long fragments.
+- FASTQ qualities use an Illumina-like positional profile: high Q values near the start of each read, gradually lower Q values toward the 3' end, and Phred-derived substitution error probabilities.
+- Only 150 bp paired-end output is currently supported.
 
 ## Included Example Data
 
@@ -161,4 +166,4 @@ The `data/` directory currently contains:
 - `matrix.tsv`: sparse example matrix
 - `offset.tsv`: example offset file
 
-These files are suitable for a quick `--skip-art` test run.
+These files are suitable for a quick paired FASTQ test run.

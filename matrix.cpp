@@ -135,6 +135,14 @@ enum class ArrangementMode {
     NonRabl
 };
 
+enum class TransModel {
+    Territory,
+    Random,
+    Telomere,
+    Compartment,
+    Hubs
+};
+
 struct SpeciesProfile {
     ArrangementMode arrangement = ArrangementMode::Territory;
     double default_trans_ratio = 0.10;
@@ -148,10 +156,12 @@ struct SpeciesProfile {
 
 struct ResolvedSyntheticOptions {
     ArrangementMode arrangement = ArrangementMode::Territory;
+    TransModel trans_model = TransModel::Territory;
     double trans_ratio = 0.10;
     double cis_decay_alpha = 1.0;
     double collision_randomness = 0.35;
     std::size_t max_cis_distance_bins = 200;
+    std::size_t trans_hotspots = 8;
     double rabl_arm_bias = 0.0;
     double rosette_center_bias = 0.0;
     double subtelomere_trans_bias = 0.0;
@@ -167,6 +177,11 @@ struct Vec3 {
 
 SpeciesProfile species_profile_for(const std::string &species_model) {
     const std::string species = to_lower(species_model);
+    if (species == "human" || species == "homo_sapiens" || species == "mammal") {
+        return SpeciesProfile{
+            ArrangementMode::Territory, 0.08, 1.05, 0.25, 0.0, 0.0, 0.08, 1.35
+        };
+    }
     if (species == "arabidopsis" || species == "athaliana" || species == "arabidopsis_thaliana") {
         return SpeciesProfile{
             ArrangementMode::Rosette, 0.06, 1.08, 0.30, 0.0, 0.35, 0.05, 1.1
@@ -215,6 +230,38 @@ ArrangementMode parse_arrangement(const std::string &arrangement_model, Arrangem
     throw std::runtime_error("Unknown arrangement model: " + arrangement_model);
 }
 
+TransModel parse_trans_model(const std::string &trans_model,
+                             ArrangementMode arrangement,
+                             const std::string &species_model) {
+    const std::string model = to_lower(trans_model);
+    if (model.empty() || model == "auto") {
+        if (arrangement == ArrangementMode::Rabl) {
+            return TransModel::Telomere;
+        }
+        const std::string species = to_lower(species_model);
+        if (species == "human" || species == "homo_sapiens" || species == "mouse" || species == "mammal") {
+            return TransModel::Compartment;
+        }
+        return TransModel::Territory;
+    }
+    if (model == "territory") {
+        return TransModel::Territory;
+    }
+    if (model == "random" || model == "collision") {
+        return TransModel::Random;
+    }
+    if (model == "telomere" || model == "subtelomere" || model == "rabl") {
+        return TransModel::Telomere;
+    }
+    if (model == "compartment" || model == "ab" || model == "a-b") {
+        return TransModel::Compartment;
+    }
+    if (model == "hubs" || model == "hub" || model == "puncta" || model == "points") {
+        return TransModel::Hubs;
+    }
+    throw std::runtime_error("Unknown trans interaction model: " + trans_model);
+}
+
 ResolvedSyntheticOptions resolve_synthetic_options(const SyntheticModelOptions &options) {
     if (options.trans_ratio < 0.0 || options.trans_ratio > 1.0) {
         throw std::runtime_error("trans_ratio must be within [0, 1].");
@@ -229,6 +276,7 @@ ResolvedSyntheticOptions resolve_synthetic_options(const SyntheticModelOptions &
     const SpeciesProfile profile = species_profile_for(options.species_model);
     ResolvedSyntheticOptions resolved;
     resolved.arrangement = parse_arrangement(options.arrangement_model, profile.arrangement);
+    resolved.trans_model = parse_trans_model(options.trans_model, resolved.arrangement, options.species_model);
     resolved.trans_ratio =
         std::abs(options.trans_ratio - 0.10) < 1e-12 ? profile.default_trans_ratio : options.trans_ratio;
     resolved.cis_decay_alpha =
@@ -236,6 +284,7 @@ ResolvedSyntheticOptions resolve_synthetic_options(const SyntheticModelOptions &
     resolved.collision_randomness =
         std::abs(options.collision_randomness - 0.35) < 1e-12 ? profile.default_collision_randomness : options.collision_randomness;
     resolved.max_cis_distance_bins = options.max_cis_distance_bins;
+    resolved.trans_hotspots = options.trans_hotspots;
     resolved.rabl_arm_bias = profile.rabl_arm_bias;
     resolved.rosette_center_bias = profile.rosette_center_bias;
     resolved.subtelomere_trans_bias = profile.subtelomere_trans_bias;
@@ -375,6 +424,44 @@ std::uint64_t contact_key(std::size_t bin1, std::size_t bin2) {
     return (static_cast<std::uint64_t>(lo) << 32U) | static_cast<std::uint64_t>(hi);
 }
 
+int compartment_label(std::size_t global_bin) {
+    std::uint64_t x = static_cast<std::uint64_t>(global_bin / 40 + 0x9e3779b97f4a7c15ULL);
+    x ^= x >> 30U;
+    x *= 0xbf58476d1ce4e5b9ULL;
+    x ^= x >> 27U;
+    x *= 0x94d049bb133111ebULL;
+    x ^= x >> 31U;
+    return static_cast<int>(x & 1ULL);
+}
+
+std::size_t sample_uniform_bin(const OffsetEntry &offset, std::mt19937_64 &rng) {
+    std::uniform_int_distribution<std::size_t> dist(offset.start_bin, offset.end_bin - 1);
+    return dist(rng);
+}
+
+std::size_t sample_telomeric_bin(const OffsetEntry &offset, std::mt19937_64 &rng) {
+    const std::size_t span = offset.end_bin - offset.start_bin;
+    if (span <= 1) {
+        return offset.start_bin;
+    }
+    const std::size_t window = std::max<std::size_t>(1, std::min<std::size_t>(span, span / 12 + 1));
+    std::uniform_int_distribution<std::size_t> edge_dist(0, window - 1);
+    if (std::bernoulli_distribution(0.5)(rng)) {
+        return offset.start_bin + edge_dist(rng);
+    }
+    return (offset.end_bin - 1) - edge_dist(rng);
+}
+
+std::size_t sample_compartment_bin(const OffsetEntry &offset, int target_compartment, std::mt19937_64 &rng) {
+    for (int attempt = 0; attempt < 16; ++attempt) {
+        const std::size_t candidate = sample_uniform_bin(offset, rng);
+        if (compartment_label(candidate) == target_compartment) {
+            return candidate;
+        }
+    }
+    return sample_uniform_bin(offset, rng);
+}
+
 void add_contact_weight(std::unordered_map<std::uint64_t, double> &weights,
                         std::size_t bin1,
                         std::size_t bin2,
@@ -412,6 +499,8 @@ ContactMatrix finalize_sparse_contacts(std::size_t bin_count,
 std::pair<std::size_t, std::size_t> sample_trans_contact(const std::vector<OffsetEntry> &offsets,
                                                          const std::vector<std::array<std::size_t, 2>> &contig_pairs,
                                                          std::discrete_distribution<std::size_t> &pair_dist,
+                                                         const std::vector<std::size_t> &hub_bins,
+                                                         const std::vector<int> &bin_to_contig,
                                                          const ResolvedSyntheticOptions &options,
                                                          std::mt19937_64 &rng) {
     if (offsets.size() < 2) {
@@ -424,10 +513,37 @@ std::pair<std::size_t, std::size_t> sample_trans_contact(const std::vector<Offse
 
     const OffsetEntry &left_offset = offsets[left_contig];
     const OffsetEntry &right_offset = offsets[right_contig];
+
+    if (options.trans_model == TransModel::Hubs && hub_bins.size() >= 2 && !bin_to_contig.empty()) {
+        std::uniform_int_distribution<std::size_t> hub_dist(0, hub_bins.size() - 1);
+        for (int attempt = 0; attempt < 32; ++attempt) {
+            const std::size_t left = hub_bins[hub_dist(rng)];
+            const std::size_t right = hub_bins[hub_dist(rng)];
+            if (left < bin_to_contig.size() && right < bin_to_contig.size() &&
+                bin_to_contig[left] >= 0 && bin_to_contig[right] >= 0 &&
+                bin_to_contig[left] != bin_to_contig[right]) {
+                return {left, right};
+            }
+        }
+    }
+
+    if (options.trans_model == TransModel::Telomere) {
+        return {sample_telomeric_bin(left_offset, rng), sample_telomeric_bin(right_offset, rng)};
+    }
+
+    if (options.trans_model == TransModel::Compartment) {
+        const int label = std::uniform_int_distribution<int>(0, 1)(rng);
+        return {sample_compartment_bin(left_offset, label, rng),
+                sample_compartment_bin(right_offset, label, rng)};
+    }
+
     const auto sample_from_offset = [&](const OffsetEntry &offset) -> std::size_t {
         const std::size_t span = offset.end_bin - offset.start_bin;
         if (span == 1) {
             return offset.start_bin;
+        }
+        if (options.trans_model == TransModel::Random) {
+            return sample_uniform_bin(offset, rng);
         }
         std::uniform_int_distribution<std::size_t> uniform_dist(offset.start_bin, offset.end_bin - 1);
         if (options.arrangement == ArrangementMode::Rabl && options.subtelomere_trans_bias > 0.0) {
@@ -810,6 +926,23 @@ ContactMatrix generate_synthetic_matrix(std::size_t bin_count,
         }
     }
     std::discrete_distribution<std::size_t> trans_pair_dist(trans_pair_weights.begin(), trans_pair_weights.end());
+    const std::vector<int> valid_bin_to_contig = build_bin_to_contig(bin_count, valid_offsets);
+    std::vector<std::size_t> hub_bins;
+    if (resolved.trans_model == TransModel::Hubs) {
+        const std::size_t hotspot_count =
+            std::max<std::size_t>(2, std::min<std::size_t>(resolved.trans_hotspots, bin_count));
+        hub_bins.reserve(hotspot_count);
+        std::vector<double> hub_contig_weights;
+        hub_contig_weights.reserve(valid_offsets.size());
+        for (const auto &offset : valid_offsets) {
+            hub_contig_weights.push_back(static_cast<double>(offset.end_bin - offset.start_bin));
+        }
+        std::discrete_distribution<std::size_t> hub_contig_dist(hub_contig_weights.begin(), hub_contig_weights.end());
+        for (std::size_t i = 0; i < hotspot_count; ++i) {
+            const OffsetEntry &offset = valid_offsets[hub_contig_dist(rng)];
+            hub_bins.push_back(sample_uniform_bin(offset, rng));
+        }
+    }
 
     std::unordered_map<std::uint64_t, double> weights;
     weights.reserve(synthetic_contact_count * 2);
@@ -818,7 +951,13 @@ ContactMatrix generate_synthetic_matrix(std::size_t bin_count,
         bool do_trans = use_trans(rng) && valid_offsets.size() > 1;
         if (do_trans) {
             const auto [left, right] =
-                sample_trans_contact(valid_offsets, trans_pairs, trans_pair_dist, resolved, rng);
+                sample_trans_contact(valid_offsets,
+                                     trans_pairs,
+                                     trans_pair_dist,
+                                     hub_bins,
+                                     valid_bin_to_contig,
+                                     resolved,
+                                     rng);
             add_contact_weight(weights, left, right, 1.0);
             continue;
         }
@@ -905,12 +1044,14 @@ ContactMatrix apply_trans_ratio(const ContactMatrix &matrix,
         std::discrete_distribution<std::size_t> trans_pair_dist(trans_pair_weights.begin(), trans_pair_weights.end());
         ResolvedSyntheticOptions trans_fill_options;
         trans_fill_options.arrangement = ArrangementMode::Territory;
+        const std::vector<std::size_t> hub_bins;
+        const std::vector<int> bin_to_contig = build_bin_to_contig(matrix.bin_count, offsets);
         const std::size_t trans_contacts_to_add =
             std::max<std::size_t>(1000, std::min<std::size_t>(200000, static_cast<std::size_t>(matrix.contacts.size() / 5 + 1)));
         const double per_contact = desired_trans / static_cast<double>(trans_contacts_to_add);
         for (std::size_t i = 0; i < trans_contacts_to_add; ++i) {
             const auto [left, right] =
-                sample_trans_contact(offsets, trans_pairs, trans_pair_dist, trans_fill_options, rng);
+                sample_trans_contact(offsets, trans_pairs, trans_pair_dist, hub_bins, bin_to_contig, trans_fill_options, rng);
             add_contact_weight(combined, left, right, per_contact);
         }
     }

@@ -12,7 +12,6 @@ struct RestrictionFragment {
     std::size_t contig_index = 0;
     std::size_t start = 0;
     std::size_t end = 0;
-    std::string sequence;
 };
 
 std::size_t infer_cut_offset(const std::string &site) {
@@ -51,6 +50,68 @@ std::string reverse_complement(const std::string &sequence) {
     return rc;
 }
 
+std::string pad_to_length(std::string sequence, std::size_t length) {
+    if (sequence.size() > length) {
+        sequence.resize(length);
+    }
+    if (sequence.size() < length) {
+        sequence.append(length - sequence.size(), 'N');
+    }
+    return sequence;
+}
+
+std::string reference_slice(const ReferenceGenome &reference,
+                            const RestrictionFragment &fragment,
+                            std::size_t start,
+                            std::size_t end) {
+    const auto &sequence = reference.contigs[fragment.contig_index].sequence;
+    if (start > end || start < fragment.start || end > fragment.end || end > sequence.size()) {
+        throw std::runtime_error("Invalid restriction fragment slice.");
+    }
+    return sequence.substr(start, end - start);
+}
+
+void append_prefix(std::string &out, const std::string &sequence, std::size_t target_length) {
+    if (out.size() >= target_length) {
+        return;
+    }
+    const std::size_t remaining = target_length - out.size();
+    out.append(sequence, 0, std::min(remaining, sequence.size()));
+}
+
+void prepend_suffix(std::string &out, const std::string &sequence, std::size_t target_length) {
+    if (out.size() >= target_length) {
+        return;
+    }
+    const std::size_t remaining = target_length - out.size();
+    const std::size_t take = std::min(remaining, sequence.size());
+    out.insert(0, sequence.substr(sequence.size() - take, take));
+}
+
+struct OrientedFragmentEnds {
+    std::string prefix;
+    std::string suffix;
+};
+
+OrientedFragmentEnds get_oriented_fragment_ends(const ReferenceGenome &reference,
+                                                const RestrictionFragment &fragment,
+                                                bool reverse_orientation,
+                                                std::size_t read_length) {
+    const std::size_t fragment_length = fragment.end - fragment.start;
+    const std::size_t take = std::min(fragment_length, read_length);
+    const std::string forward_prefix =
+        reference_slice(reference, fragment, fragment.start, fragment.start + take);
+    const std::string forward_suffix =
+        reference_slice(reference, fragment, fragment.end - take, fragment.end);
+
+    if (!reverse_orientation) {
+        return OrientedFragmentEnds{forward_prefix, forward_suffix};
+    }
+
+    return OrientedFragmentEnds{reverse_complement(forward_suffix),
+                                reverse_complement(forward_prefix)};
+}
+
 std::vector<RestrictionFragment> digest_contig(const Contig &contig,
                                                std::size_t contig_index,
                                                const std::string &site,
@@ -72,7 +133,7 @@ std::vector<RestrictionFragment> digest_contig(const Contig &contig,
         const std::size_t cut = pos + cut_offset;
         if (cut > start) {
             fragments.push_back(RestrictionFragment{
-                next_id++, contig_index, start, cut, contig.sequence.substr(start, cut - start)});
+                next_id++, contig_index, start, cut});
         }
         start = cut;
         pos = pos + 1;
@@ -80,12 +141,11 @@ std::vector<RestrictionFragment> digest_contig(const Contig &contig,
 
     if (start < contig.sequence.size()) {
         fragments.push_back(RestrictionFragment{
-            next_id++, contig_index, start, contig.sequence.size(),
-            contig.sequence.substr(start, contig.sequence.size() - start)});
+            next_id++, contig_index, start, contig.sequence.size()});
     }
 
     if (fragments.empty()) {
-        fragments.push_back(RestrictionFragment{next_id++, contig_index, 0, contig.sequence.size(), contig.sequence});
+        fragments.push_back(RestrictionFragment{next_id++, contig_index, 0, contig.sequence.size()});
     }
 
     return fragments;
@@ -102,23 +162,25 @@ std::vector<std::size_t> bins_for_fragment(const RestrictionFragment &fragment, 
     return bins;
 }
 
-}  // namespace
+struct FragmentSamplingIndex {
+    std::vector<RestrictionFragment> fragments;
+    std::vector<std::vector<std::size_t>> bin_to_fragments;
+};
 
-std::vector<LigationProduct> create_ligation_products(const Config &cfg,
-                                                      const ReferenceGenome &reference,
-                                                      const std::vector<OffsetEntry> &offsets,
-                                                      const ContactMatrix &matrix) {
+FragmentSamplingIndex build_fragment_sampling_index(const Config &cfg,
+                                                    const ReferenceGenome &reference,
+                                                    const std::vector<OffsetEntry> &offsets,
+                                                    std::size_t matrix_bin_count) {
     std::unordered_map<std::string, std::size_t> contig_lookup;
     for (std::size_t i = 0; i < reference.contigs.size(); ++i) {
         contig_lookup.emplace(reference.contigs[i].name, i);
     }
 
-    std::vector<RestrictionFragment> fragments;
-    std::vector<std::vector<std::size_t>> bin_to_fragments(matrix.bin_count);
+    FragmentSamplingIndex index;
+    index.bin_to_fragments.resize(matrix_bin_count);
+
     std::size_t next_fragment_id = 0;
     const std::size_t cut_offset = infer_cut_offset(cfg.enzyme_site);
-    const std::string ligation_junction = build_ligation_junction(cfg.enzyme_site, cut_offset);
-
     for (const auto &offset : offsets) {
         const auto it = contig_lookup.find(offset.contig);
         if (it == contig_lookup.end()) {
@@ -138,19 +200,24 @@ std::vector<LigationProduct> create_ligation_products(const Config &cfg,
             const auto local_bins = bins_for_fragment(fragment, cfg.bin_size);
             for (const std::size_t local_bin : local_bins) {
                 const std::size_t global_bin = offset.start_bin + local_bin;
-                if (global_bin >= bin_to_fragments.size()) {
+                if (global_bin >= index.bin_to_fragments.size()) {
                     throw std::runtime_error("Fragment bin exceeds matrix bin count.");
                 }
-                bin_to_fragments[global_bin].push_back(fragment.id);
+                index.bin_to_fragments[global_bin].push_back(fragment.id);
             }
-            fragments.push_back(fragment);
+            index.fragments.push_back(fragment);
         }
     }
 
-    if (fragments.empty()) {
+    if (index.fragments.empty()) {
         throw std::runtime_error("Restriction digest produced no fragments.");
     }
 
+    return index;
+}
+
+std::vector<double> build_contact_sampling_weights(const ContactMatrix &matrix,
+                                                   const std::vector<std::vector<std::size_t>> &bin_to_fragments) {
     std::vector<double> weights;
     weights.reserve(matrix.contacts.size());
     double total_weight = 0.0;
@@ -166,43 +233,77 @@ std::vector<LigationProduct> create_ligation_products(const Config &cfg,
         throw std::runtime_error("Contact matrix does not overlap any valid reference bins.");
     }
 
+    return weights;
+}
+
+ReadPairTemplate make_read_template(const std::string &name,
+                                    const OrientedFragmentEnds &left,
+                                    const std::string &ligation_junction,
+                                    const OrientedFragmentEnds &right,
+                                    std::size_t read_length) {
+    std::string read1_template;
+    read1_template.reserve(read_length);
+    append_prefix(read1_template, left.prefix, read_length);
+    append_prefix(read1_template, ligation_junction, read_length);
+    append_prefix(read1_template, right.prefix, read_length);
+
+    std::string read2_insert_suffix;
+    read2_insert_suffix.reserve(read_length);
+    prepend_suffix(read2_insert_suffix, right.suffix, read_length);
+    prepend_suffix(read2_insert_suffix, ligation_junction, read_length);
+    prepend_suffix(read2_insert_suffix, left.suffix, read_length);
+
+    return ReadPairTemplate{
+        name,
+        pad_to_length(read1_template, read_length),
+        pad_to_length(reverse_complement(read2_insert_suffix), read_length)
+    };
+}
+
+}  // namespace
+
+std::vector<ReadPairTemplate> create_hic_read_templates(const Config &cfg,
+                                                        const ReferenceGenome &reference,
+                                                        const std::vector<OffsetEntry> &offsets,
+                                                        const ContactMatrix &matrix) {
+    const auto index = build_fragment_sampling_index(cfg, reference, offsets, matrix.bin_count);
+    const std::size_t cut_offset = infer_cut_offset(cfg.enzyme_site);
+    const std::string ligation_junction = build_ligation_junction(cfg.enzyme_site, cut_offset);
+    const std::vector<double> weights = build_contact_sampling_weights(matrix, index.bin_to_fragments);
+
     std::discrete_distribution<std::size_t> contact_dist(weights.begin(), weights.end());
     std::mt19937_64 rng(cfg.seed + 1);
-    std::vector<LigationProduct> products;
-    products.reserve(cfg.pair_count);
+    std::vector<ReadPairTemplate> read_pairs;
+    read_pairs.reserve(cfg.pair_count);
 
     for (std::size_t i = 0; i < cfg.pair_count; ++i) {
         const Contact &contact = matrix.contacts[contact_dist(rng)];
-        const auto &left_candidates = bin_to_fragments[contact.bin1];
-        const auto &right_candidates = bin_to_fragments[contact.bin2];
+        const auto &left_candidates = index.bin_to_fragments[contact.bin1];
+        const auto &right_candidates = index.bin_to_fragments[contact.bin2];
         std::uniform_int_distribution<std::size_t> left_dist(0, left_candidates.size() - 1);
         std::uniform_int_distribution<std::size_t> right_dist(0, right_candidates.size() - 1);
 
-        const RestrictionFragment &left = fragments[left_candidates[left_dist(rng)]];
+        const RestrictionFragment &left = index.fragments[left_candidates[left_dist(rng)]];
         std::size_t right_index = right_candidates[right_dist(rng)];
         if (right_candidates.size() > 1 || left_candidates.size() > 1) {
             for (int retry = 0; retry < 8 && right_index == left.id; ++retry) {
                 right_index = right_candidates[right_dist(rng)];
             }
         }
-        const RestrictionFragment &right = fragments[right_index];
+        const RestrictionFragment &right = index.fragments[right_index];
 
-        std::string left_seq = left.sequence;
-        std::string right_seq = right.sequence;
-        if (std::uniform_int_distribution<int>(0, 1)(rng) == 1) {
-            left_seq = reverse_complement(left_seq);
-        }
-        if (std::uniform_int_distribution<int>(0, 1)(rng) == 1) {
-            right_seq = reverse_complement(right_seq);
-        }
+        const bool reverse_left = std::uniform_int_distribution<int>(0, 1)(rng) == 1;
+        const bool reverse_right = std::uniform_int_distribution<int>(0, 1)(rng) == 1;
+        const OrientedFragmentEnds left_ends =
+            get_oriented_fragment_ends(reference, left, reverse_left, cfg.read_length);
+        const OrientedFragmentEnds right_ends =
+            get_oriented_fragment_ends(reference, right, reverse_right, cfg.read_length);
 
-        LigationProduct product;
-        product.name = "ligation_" + std::to_string(i + 1) +
-                       "_bin" + std::to_string(contact.bin1) +
-                       "_bin" + std::to_string(contact.bin2);
-        product.sequence = left_seq + ligation_junction + right_seq;
-        products.push_back(std::move(product));
+        const std::string name = "hicreate_" + std::to_string(i + 1) +
+                                 "_bin" + std::to_string(contact.bin1) +
+                                 "_bin" + std::to_string(contact.bin2);
+        read_pairs.push_back(make_read_template(name, left_ends, ligation_junction, right_ends, cfg.read_length));
     }
 
-    return products;
+    return read_pairs;
 }

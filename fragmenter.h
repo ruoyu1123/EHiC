@@ -6,12 +6,13 @@
 #include <string>
 #include <vector>
 
-struct LigationProduct {
+struct ReadPairTemplate {
     std::string name;
-    std::string sequence;
+    std::string read1;
+    std::string read2;
 };
 
-std::vector<LigationProduct> create_ligation_products(const Config &cfg,
-                                                      const ReferenceGenome &reference,
-                                                      const std::vector<OffsetEntry> &offsets,
-                                                      const ContactMatrix &matrix);
+std::vector<ReadPairTemplate> create_hic_read_templates(const Config &cfg,
+                                                        const ReferenceGenome &reference,
+                                                        const std::vector<OffsetEntry> &offsets,
+                                                        const ContactMatrix &matrix);

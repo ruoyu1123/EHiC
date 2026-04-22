@@ -28,6 +28,8 @@ struct SyntheticModelOptions {
     std::size_t max_cis_distance_bins = 200;
     std::string species_model = "generic_plant";
     std::string arrangement_model = "auto";
+    std::string trans_model = "auto";
+    std::size_t trans_hotspots = 8;
     double collision_randomness = 0.35;
     std::uint64_t seed = 1;
 };

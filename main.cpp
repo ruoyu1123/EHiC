@@ -4,6 +4,7 @@
 #include "reference.h"
 #include "simulator.h"
 #include <algorithm>
+#include <cmath>
 #include <iostream>
 #include <unordered_map>
 #include <stdexcept>
@@ -47,13 +48,18 @@ void print_usage() {
     std::cerr 
         << "Usage:\n"
         << "  hicreate --reference ref.fa [--matrix matrix.tsv] --bin-size 10000\n"
-        << "           [--read-length 150] [--pairs 100000] [--output-prefix sim]\n"
-        << "           [--offset offsets.tsv] [--enzyme-site AAGCTT] [--skip-art]\n"
-        << "           [--seed 123] [--insert-mean 150] [--insert-std 25]\n"
+        << "           [--coverage 30] [--pairs 100000] [--output-prefix sim]\n"
+        << "           [--offset offsets.tsv] [--enzyme-site AAGCTT]\n"
+        << "           [--seed 123]\n"
         << "           [--trans-ratio 0.10] [--synthetic-contacts 200000]\n"
         << "           [--cis-decay-alpha 1.0] [--max-cis-distance-bins 200]\n"
         << "           [--species-model generic_plant] [--arrangement-model auto]\n"
+        << "           [--trans-model auto] [--trans-hotspots 8]\n"
         << "           [--collision-randomness 0.35]\n\n"
+        << "Output reads:\n"
+        << "  Always writes 150 bp paired-end FASTQ.\n"
+        << "  --coverage X sets read pairs to ceil(X * reference_bases / 300).\n"
+        << "  --pairs is the exact number of read pairs when --coverage is omitted.\n\n"
         << "Input matrix:\n"
         << "  Sparse: bin1 bin2 value\n"
         << "  Dense: headerless square numeric matrix\n\n"
@@ -89,12 +95,11 @@ Config parse_args(int argc, char **argv) {
             cfg.read_length = std::stoull(require_value(arg));
         } else if (arg == "--pairs") {
             cfg.pair_count = std::stoull(require_value(arg));
+            cfg.pair_count_explicit = true;
+        } else if (arg == "--coverage" || arg == "--depth") {
+            cfg.coverage_depth = std::stod(require_value(arg));
         } else if (arg == "--seed") {
             cfg.seed = std::stoull(require_value(arg));
-        } else if (arg == "--insert-mean") {
-            cfg.insert_mean = std::stod(require_value(arg));
-        } else if (arg == "--insert-std") {
-            cfg.insert_std = std::stod(require_value(arg));
         } else if (arg == "--trans-ratio") {
             cfg.trans_ratio = std::stod(require_value(arg));
         } else if (arg == "--synthetic-contacts") {
@@ -107,10 +112,12 @@ Config parse_args(int argc, char **argv) {
             cfg.species_model = require_value(arg);
         } else if (arg == "--arrangement-model") {
             cfg.arrangement_model = require_value(arg);
+        } else if (arg == "--trans-model") {
+            cfg.trans_model = require_value(arg);
+        } else if (arg == "--trans-hotspots") {
+            cfg.trans_hotspots = std::stoull(require_value(arg));
         } else if (arg == "--collision-randomness") {
             cfg.collision_randomness = std::stod(require_value(arg));
-        } else if (arg == "--skip-art") {
-            cfg.skip_art = true;
         } else if (arg == "--help" || arg == "-h") {
             print_usage();
             std::exit(0);
@@ -128,8 +135,17 @@ Config parse_args(int argc, char **argv) {
     if (cfg.read_length == 0) {
         throw std::runtime_error("--read-length must be positive.");
     }
-    if (cfg.pair_count == 0) {
-        throw std::runtime_error("--pairs must be positive.");
+    if (cfg.read_length != 150) {
+        throw std::runtime_error("Only 150 bp paired-end reads are supported.");
+    }
+    if (cfg.coverage_depth < 0.0) {
+        throw std::runtime_error("--coverage must be non-negative.");
+    }
+    if (cfg.coverage_depth > 0.0 && cfg.pair_count_explicit) {
+        throw std::runtime_error("Use either --coverage or --pairs, not both.");
+    }
+    if (cfg.coverage_depth == 0.0 && cfg.pair_count == 0) {
+        throw std::runtime_error("--pairs must be positive when --coverage is omitted.");
     }
     if (cfg.trans_ratio < 0.0 || cfg.trans_ratio > 1.0) {
         throw std::runtime_error("--trans-ratio must be within [0, 1].");
@@ -148,10 +164,16 @@ Config parse_args(int argc, char **argv) {
 
 int main(int argc, char **argv) {
     try {
-        const Config cfg = parse_args(argc, argv);
+        Config cfg = parse_args(argc, argv);
         const ReferenceGenome reference = load_reference_fasta(cfg.reference_path);
         if (cfg.read_length >= reference.total_length()) {
             throw std::runtime_error("Read length must be shorter than the total reference length.");
+        }
+        if (cfg.coverage_depth > 0.0) {
+            const double requested_pairs =
+                std::ceil(cfg.coverage_depth * static_cast<double>(reference.total_length()) /
+                          static_cast<double>(2 * cfg.read_length));
+            cfg.pair_count = std::max<std::size_t>(1, static_cast<std::size_t>(requested_pairs));
         }
 
         const std::size_t total_bins = reference.total_bins(cfg.bin_size);
@@ -172,6 +194,8 @@ int main(int argc, char **argv) {
         model_options.max_cis_distance_bins = cfg.max_cis_distance_bins;
         model_options.species_model = cfg.species_model;
         model_options.arrangement_model = cfg.arrangement_model;
+        model_options.trans_model = cfg.trans_model;
+        model_options.trans_hotspots = cfg.trans_hotspots;
         model_options.collision_randomness = cfg.collision_randomness;
         model_options.seed = cfg.seed;
 
@@ -208,21 +232,17 @@ int main(int argc, char **argv) {
                                               synthetic_contacts,
                                               model_options);
         }
-        const auto ligation_products = create_ligation_products(cfg, reference, reference_offsets, matrix);
-        simulate_reads_with_artillumina(cfg, ligation_products);
-
-        std::size_t total_library_bases = 0;
-        for (const auto &product : ligation_products) {
-            total_library_bases += product.sequence.size();
-        }
+        const auto read_templates = create_hic_read_templates(cfg, reference, reference_offsets, matrix);
+        simulate_paired_reads(cfg, read_templates);
 
         std::cout << "Contigs: " << reference.contigs.size() << '\n'
                   << "Reference length: " << reference.total_length() << '\n'
                   << "Global bins: " << total_bins << '\n'
                   << "Contacts loaded: " << matrix.contacts.size() << '\n'
-                  << "Ligation products: " << ligation_products.size() << '\n'
-                  << "Library bases: " << total_library_bases << '\n'
-                  << "Output FASTA: " << cfg.output_prefix << "_fragments.fa\n";
+                  << "Read pairs: " << read_templates.size() << '\n'
+                  << "Coverage: " << (static_cast<double>(read_templates.size() * 2 * cfg.read_length) /
+                                      static_cast<double>(reference.total_length())) << "x\n"
+                  << "Read length: " << cfg.read_length << '\n';
     } catch (const std::exception &ex) {
         std::cerr << "Error: " << ex.what() << '\n';
         print_usage();

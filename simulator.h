@@ -4,4 +4,4 @@
 #include "fragmenter.h"
 #include <vector>
 
-void simulate_reads_with_artillumina(const Config &cfg, const std::vector<LigationProduct> &products);
+void simulate_paired_reads(const Config &cfg, const std::vector<ReadPairTemplate> &read_templates);
