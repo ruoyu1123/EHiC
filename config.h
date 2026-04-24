@@ -12,6 +12,7 @@ struct Config {
     std::size_t bin_size = 0;
     std::size_t read_length = 150;
     std::size_t pair_count = 100000;
+    std::size_t thread_count = 1;
     bool pair_count_explicit = false;
     double coverage_depth = 0.0;
     std::uint64_t seed = 1;

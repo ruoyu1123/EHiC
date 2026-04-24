@@ -100,34 +100,76 @@ void write_fastq_record(std::ofstream &out,
         << read.qualities << '\n';
 }
 
+void append_fastq_record(std::string &out,
+                         const std::string &name,
+                         const SimulatedRead &read) {
+    out.push_back('@');
+    out += name;
+    out.push_back('\n');
+    out += read.sequence;
+    out += "\n+\n";
+    out += read.qualities;
+    out.push_back('\n');
+}
+
 }  // namespace
 
-void simulate_paired_reads(const Config &cfg, const std::vector<ReadPairTemplate> &read_templates) {
-    if (read_templates.empty()) {
-        throw std::runtime_error("No read templates were generated.");
-    }
-    if (cfg.read_length != 150) {
+void append_simulated_fastq_pair(const Config &cfg,
+                                 const ReadPairTemplate &read_template,
+                                 std::mt19937_64 &rng,
+                                 std::string &read1_out,
+                                 std::string &read2_out) {
+    const SimulatedRead read1 = simulate_read(read_template.read1, cfg.read_length, rng);
+    const SimulatedRead read2 = simulate_read(read_template.read2, cfg.read_length, rng);
+    append_fastq_record(read1_out, read_template.name + "/1", read1);
+    append_fastq_record(read2_out, read_template.name + "/2", read2);
+}
+
+PairedReadWriter::PairedReadWriter(const Config &cfg)
+    : cfg_(cfg),
+      read1_path_(cfg.output_prefix + "_R1.fastq"),
+      read2_path_(cfg.output_prefix + "_R2.fastq"),
+      read1_out_(read1_path_),
+      read2_out_(read2_path_),
+      rng_(cfg.seed + 2027) {
+    if (cfg_.read_length != 150) {
         throw std::runtime_error("Built-in read simulation currently supports only 150 bp paired-end reads.");
     }
-
-    const std::string read1_path = cfg.output_prefix + "_R1.fastq";
-    const std::string read2_path = cfg.output_prefix + "_R2.fastq";
-    std::ofstream read1_out(read1_path);
-    std::ofstream read2_out(read2_path);
-    if (!read1_out || !read2_out) {
+    if (!read1_out_ || !read2_out_) {
         throw std::runtime_error("Failed to open paired FASTQ output files.");
     }
+}
 
-    std::mt19937_64 rng(cfg.seed + 2027);
-    for (std::size_t i = 0; i < read_templates.size(); ++i) {
-        const auto &templ = read_templates[i];
-        const SimulatedRead read1 = simulate_read(templ.read1, cfg.read_length, rng);
-        const SimulatedRead read2 = simulate_read(templ.read2, cfg.read_length, rng);
-        write_fastq_record(read1_out, templ.name + "/1", read1);
-        write_fastq_record(read2_out, templ.name + "/2", read2);
+void PairedReadWriter::write_template(const ReadPairTemplate &read_template) {
+    const SimulatedRead read1 = simulate_read(read_template.read1, cfg_.read_length, rng_);
+    const SimulatedRead read2 = simulate_read(read_template.read2, cfg_.read_length, rng_);
+    write_fastq_record(read1_out_, read_template.name + "/1", read1);
+    write_fastq_record(read2_out_, read_template.name + "/2", read2);
+    const std::size_t previous_count = count_;
+    ++count_;
+    if (count_ / 1000000 > previous_count / 1000000) {
+        std::cerr << "Wrote " << count_ << " read pairs...\n";
     }
+}
 
-    std::cout << "Output read pairs: " << read_templates.size() << '\n'
-              << "Output FASTQ R1: " << read1_path << '\n'
-              << "Output FASTQ R2: " << read2_path << '\n';
+void PairedReadWriter::write_block(const FastqBlock &block) {
+    read1_out_ << block.read1;
+    read2_out_ << block.read2;
+    const std::size_t previous_count = count_;
+    count_ += block.pair_count;
+    if (count_ / 1000000 > previous_count / 1000000) {
+        std::cerr << "Wrote " << count_ << " read pairs...\n";
+    }
+}
+
+std::size_t PairedReadWriter::count() const {
+    return count_;
+}
+
+const std::string &PairedReadWriter::read1_path() const {
+    return read1_path_;
+}
+
+const std::string &PairedReadWriter::read2_path() const {
+    return read2_path_;
 }

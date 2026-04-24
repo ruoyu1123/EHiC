@@ -36,9 +36,10 @@ Outputs:
 ## Command Line
 
 ```text
-hicreate --reference ref.fa [--matrix matrix.tsv] --bin-size 1000 \
-         [--coverage 30] [--pairs 100000] [--output-prefix sim] \
-         [--offset offset.tsv] [--enzyme-site AAGCTT] [--seed 42] \
+hicreate ref.fa 1000 \
+         [--matrix matrix.tsv] \
+         [--coverage X | --pairs 100000] [--output-prefix sim] \
+         [--offset offset.tsv] [--enzyme-site AAGCTT] [--seed 42] [--threads 4] \
          [--trans-ratio 0.10] [--synthetic-contacts 200000] \
          [--cis-decay-alpha 1.0] [--max-cis-distance-bins 200] \
          [--species-model generic_plant] [--arrangement-model auto] \
@@ -48,25 +49,32 @@ hicreate --reference ref.fa [--matrix matrix.tsv] --bin-size 1000 \
 
 Required arguments:
 
-- `--reference`: input reference FASTA
-- `--bin-size`: genomic bin size used by the matrix
+- `ref.fa`: input reference FASTA as the first positional argument
+- `1000`: genomic bin size as the second positional argument
+
+The older flag form is still supported for compatibility:
+
+```text
+hicreate --reference ref.fa --bin-size 1000 [options]
+```
 
 Optional arguments:
 
-- `--matrix`: input Hi-C matrix (if omitted, `hicreate` builds a synthetic matrix from the genome)
-- `--offset`: contig-to-global-bin mapping file
-- `--coverage`: target read depth over the reference genome; pairs are computed as `ceil(coverage * reference_bases / 300)`
-- `--pairs`: number of 150 bp paired-end read pairs to write, default `100000`
-- `--output-prefix`: prefix for output files, default `sim`
-- `--enzyme-site`: restriction enzyme motif, default `AAGCTT`
-- `--seed`: random seed
-- `--trans-ratio`: target fraction of trans-chromosomal interaction mass (default `0.10`)
+- `-m`, `--matrix`: input Hi-C matrix (if omitted, `hicreate` builds a synthetic matrix from the genome)
+- `-f`, `--offset`: contig-to-global-bin mapping file
+- `-c`, `--coverage`: target read depth over the reference genome; pairs are computed as `ceil(coverage * reference_bases / 300)`
+- `-p`, `--pairs`: number of 150 bp paired-end read pairs to write, default `100000` when `--coverage` is omitted
+- `-o`, `--output-prefix`: prefix for output files, default `sim`
+- `-e`, `--enzyme-site`: restriction enzyme motif, default `AAGCTT`
+- `-s`, `--seed`: random seed
+- `-j`, `--threads`: worker threads for read generation, default `1`; use `0` to auto-detect hardware threads
+- `-t`, `--trans-ratio`: target fraction of trans-chromosomal interaction mass (default `0.10`)
 - `--synthetic-contacts`: number of sparse contacts used to build synthetic matrix (auto if omitted)
 - `--cis-decay-alpha`: cis distance-decay exponent (default `1.0`)
 - `--max-cis-distance-bins`: max cis bin separation for synthetic matrix (default `200`)
-- `--species-model`: synthetic matrix species preset (`generic_plant`, `human`, `arabidopsis`, `rice`, `maize`, `wheat`, `barley`)
-- `--arrangement-model`: chromosome arrangement override (`auto`, `territory`, `rabl`, `rosette`, `nonrabl`)
-- `--trans-model`: trans interaction style (`auto`, `territory`, `random`, `telomere`, `compartment`, `hubs`)
+- `-S`, `--species-model`: synthetic matrix species preset (`generic_plant`, `human`, `arabidopsis`, `rice`, `maize`, `wheat`, `barley`)
+- `-A`, `--arrangement-model`: chromosome arrangement override (`auto`, `territory`, `rabl`, `rosette`, `nonrabl`)
+- `-T`, `--trans-model`: trans interaction style (`auto`, `territory`, `random`, `telomere`, `compartment`, `hubs`)
 - `--trans-hotspots`: number of trans hub bins for `--trans-model hubs`, default `8`
 - `--collision-randomness`: random collision baseline in trans sampling (0-1, default `0.35`)
 
@@ -114,15 +122,15 @@ chr2    2000        3500
 Windows:
 
 ```powershell
-.\hicreate.exe --reference data\ref.fa --matrix data\matrix.tsv --offset data\offset.tsv `
-  --bin-size 1000 --pairs 1000 --output-prefix data\sim
+.\hicreate.exe data\ref.fa 1000 -m data\matrix.tsv -f data\offset.tsv `
+  -p 1000 -o data\sim
 ```
 
 Linux:
 
 ```bash
-./hicreate --reference data/ref.fa --matrix data/matrix.tsv --offset data/offset.tsv \
-  --bin-size 1000 --pairs 1000 --output-prefix data/sim
+./hicreate data/ref.fa 1000 -m data/matrix.tsv -f data/offset.tsv \
+  -p 1000 -o data/sim
 ```
 
 ## Output
@@ -133,7 +141,7 @@ Main output:
 - `<prefix>_R2.fastq`: second reads
 
 `--pairs` is the exact number of records written to each FASTQ file.
-If `--coverage` is provided, it replaces `--pairs` and computes the FASTQ record count from the reference size.
+If `--coverage` is provided, it replaces `--pairs` and computes the FASTQ record count from the reference size. `--coverage` and `--pairs` are mutually exclusive; using both is an error. There is no default 30x coverage unless you explicitly pass `--coverage 30`.
 
 ## Simulation Notes
 
@@ -155,6 +163,8 @@ If `--coverage` is provided, it replaces `--pairs` and computes the FASTQ record
 - Common enzyme cut offsets are recognized for motifs such as HindIII and DpnII/MboI.
 - Ligation products include an explicit fill-in ligation junction, but the program does not materialize full ligation molecules per read pair.
 - For each sampled ligation event, only the required 150 bp prefixes/suffixes are sliced from the two restriction-fragment coordinates. This is equivalent to generating reads from the two ends of the virtual ligated sequence without copying long fragments.
+- Read pairs are generated in bounded FASTQ blocks and streamed to disk, so memory does not scale with `--pairs` or `--coverage`.
+- `--threads` parallelizes read-pair sampling, template construction, quality simulation, and FASTQ block formatting; a single writer preserves ordered output and avoids file-write lock contention.
 - FASTQ qualities use an Illumina-like positional profile: high Q values near the start of each read, gradually lower Q values toward the 3' end, and Phred-derived substitution error probabilities.
 - Only 150 bp paired-end output is currently supported.
 

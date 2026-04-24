@@ -12,7 +12,10 @@ struct ReadPairTemplate {
     std::string read2;
 };
 
-std::vector<ReadPairTemplate> create_hic_read_templates(const Config &cfg,
-                                                        const ReferenceGenome &reference,
-                                                        const std::vector<OffsetEntry> &offsets,
-                                                        const ContactMatrix &matrix);
+class PairedReadWriter;
+
+void write_hic_reads(const Config &cfg,
+                     const ReferenceGenome &reference,
+                     const std::vector<OffsetEntry> &offsets,
+                     const ContactMatrix &matrix,
+                     PairedReadWriter &writer);

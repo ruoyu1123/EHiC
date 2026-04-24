@@ -10,4 +10,4 @@ $sources = @(
     "simulator.cpp"
 )
 
-& $compiler "-std=c++17" "-O2" "-Wall" "-Wextra" "-pedantic" "-o" $output @sources
+& $compiler "-std=c++17" "-O2" "-Wall" "-Wextra" "-pedantic" "-pthread" "-o" $output @sources

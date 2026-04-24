@@ -4,6 +4,6 @@ set -eu
 compiler="${CXX:-g++}"
 output="hicreate"
 
-"$compiler" -std=c++17 -O2 -Wall -Wextra -pedantic \
+"$compiler" -std=c++17 -O2 -Wall -Wextra -pedantic -pthread \
   -o "$output" \
   main.cpp matrix.cpp reference.cpp fragmenter.cpp simulator.cpp

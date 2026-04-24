@@ -1,8 +1,15 @@
 #include "fragmenter.h"
+#include "simulator.h"
 #include <algorithm>
+#include <atomic>
 #include <cctype>
+#include <condition_variable>
+#include <exception>
+#include <map>
+#include <mutex>
 #include <random>
 #include <stdexcept>
+#include <thread>
 #include <unordered_map>
 
 namespace {
@@ -260,12 +267,48 @@ ReadPairTemplate make_read_template(const std::string &name,
     };
 }
 
-}  // namespace
+ReadPairTemplate sample_one_read_template(const Config &cfg,
+                                          const ReferenceGenome &reference,
+                                          const FragmentSamplingIndex &index,
+                                          const ContactMatrix &matrix,
+                                          const std::string &ligation_junction,
+                                          std::discrete_distribution<std::size_t> &contact_dist,
+                                          std::mt19937_64 &rng,
+                                          std::size_t pair_index) {
+    const Contact &contact = matrix.contacts[contact_dist(rng)];
+    const auto &left_candidates = index.bin_to_fragments[contact.bin1];
+    const auto &right_candidates = index.bin_to_fragments[contact.bin2];
+    std::uniform_int_distribution<std::size_t> left_dist(0, left_candidates.size() - 1);
+    std::uniform_int_distribution<std::size_t> right_dist(0, right_candidates.size() - 1);
 
-std::vector<ReadPairTemplate> create_hic_read_templates(const Config &cfg,
-                                                        const ReferenceGenome &reference,
-                                                        const std::vector<OffsetEntry> &offsets,
-                                                        const ContactMatrix &matrix) {
+    const RestrictionFragment &left = index.fragments[left_candidates[left_dist(rng)]];
+    std::size_t right_index = right_candidates[right_dist(rng)];
+    if (right_candidates.size() > 1 || left_candidates.size() > 1) {
+        for (int retry = 0; retry < 8 && right_index == left.id; ++retry) {
+            right_index = right_candidates[right_dist(rng)];
+        }
+    }
+    const RestrictionFragment &right = index.fragments[right_index];
+
+    const bool reverse_left = std::uniform_int_distribution<int>(0, 1)(rng) == 1;
+    const bool reverse_right = std::uniform_int_distribution<int>(0, 1)(rng) == 1;
+    const OrientedFragmentEnds left_ends =
+        get_oriented_fragment_ends(reference, left, reverse_left, cfg.read_length);
+    const OrientedFragmentEnds right_ends =
+        get_oriented_fragment_ends(reference, right, reverse_right, cfg.read_length);
+
+    const std::string name = "hicreate_" + std::to_string(pair_index + 1) +
+                             "_bin" + std::to_string(contact.bin1) +
+                             "_bin" + std::to_string(contact.bin2);
+    return make_read_template(name, left_ends, ligation_junction, right_ends, cfg.read_length);
+}
+
+template <typename EmitReadPair>
+void sample_hic_read_templates(const Config &cfg,
+                               const ReferenceGenome &reference,
+                               const std::vector<OffsetEntry> &offsets,
+                               const ContactMatrix &matrix,
+                               EmitReadPair emit) {
     const auto index = build_fragment_sampling_index(cfg, reference, offsets, matrix.bin_count);
     const std::size_t cut_offset = infer_cut_offset(cfg.enzyme_site);
     const std::string ligation_junction = build_ligation_junction(cfg.enzyme_site, cut_offset);
@@ -273,37 +316,133 @@ std::vector<ReadPairTemplate> create_hic_read_templates(const Config &cfg,
 
     std::discrete_distribution<std::size_t> contact_dist(weights.begin(), weights.end());
     std::mt19937_64 rng(cfg.seed + 1);
-    std::vector<ReadPairTemplate> read_pairs;
-    read_pairs.reserve(cfg.pair_count);
 
     for (std::size_t i = 0; i < cfg.pair_count; ++i) {
-        const Contact &contact = matrix.contacts[contact_dist(rng)];
-        const auto &left_candidates = index.bin_to_fragments[contact.bin1];
-        const auto &right_candidates = index.bin_to_fragments[contact.bin2];
-        std::uniform_int_distribution<std::size_t> left_dist(0, left_candidates.size() - 1);
-        std::uniform_int_distribution<std::size_t> right_dist(0, right_candidates.size() - 1);
+        emit(sample_one_read_template(cfg, reference, index, matrix, ligation_junction, contact_dist, rng, i));
+    }
+}
 
-        const RestrictionFragment &left = index.fragments[left_candidates[left_dist(rng)]];
-        std::size_t right_index = right_candidates[right_dist(rng)];
-        if (right_candidates.size() > 1 || left_candidates.size() > 1) {
-            for (int retry = 0; retry < 8 && right_index == left.id; ++retry) {
-                right_index = right_candidates[right_dist(rng)];
-            }
+}  // namespace
+
+void write_hic_reads(const Config &cfg,
+                     const ReferenceGenome &reference,
+                     const std::vector<OffsetEntry> &offsets,
+                     const ContactMatrix &matrix,
+                     PairedReadWriter &writer) {
+    const auto index = build_fragment_sampling_index(cfg, reference, offsets, matrix.bin_count);
+    const std::size_t cut_offset = infer_cut_offset(cfg.enzyme_site);
+    const std::string ligation_junction = build_ligation_junction(cfg.enzyme_site, cut_offset);
+    const std::vector<double> weights = build_contact_sampling_weights(matrix, index.bin_to_fragments);
+
+    const std::size_t worker_count = std::max<std::size_t>(1, cfg.thread_count);
+    if (worker_count == 1 || cfg.pair_count < 20000) {
+        std::discrete_distribution<std::size_t> contact_dist(weights.begin(), weights.end());
+        std::mt19937_64 rng(cfg.seed + 1);
+        for (std::size_t i = 0; i < cfg.pair_count; ++i) {
+            writer.write_template(
+                sample_one_read_template(cfg, reference, index, matrix, ligation_junction, contact_dist, rng, i));
         }
-        const RestrictionFragment &right = index.fragments[right_index];
-
-        const bool reverse_left = std::uniform_int_distribution<int>(0, 1)(rng) == 1;
-        const bool reverse_right = std::uniform_int_distribution<int>(0, 1)(rng) == 1;
-        const OrientedFragmentEnds left_ends =
-            get_oriented_fragment_ends(reference, left, reverse_left, cfg.read_length);
-        const OrientedFragmentEnds right_ends =
-            get_oriented_fragment_ends(reference, right, reverse_right, cfg.read_length);
-
-        const std::string name = "hicreate_" + std::to_string(i + 1) +
-                                 "_bin" + std::to_string(contact.bin1) +
-                                 "_bin" + std::to_string(contact.bin2);
-        read_pairs.push_back(make_read_template(name, left_ends, ligation_junction, right_ends, cfg.read_length));
+        return;
     }
 
-    return read_pairs;
+    constexpr std::size_t pairs_per_block = 8192;
+    const std::size_t total_blocks = (cfg.pair_count + pairs_per_block - 1) / pairs_per_block;
+    std::atomic<std::size_t> next_block{0};
+    std::atomic<std::size_t> finished_workers{0};
+    std::atomic<bool> stop_workers{false};
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::map<std::size_t, FastqBlock> ready_blocks;
+    std::exception_ptr worker_error;
+
+    const auto make_block = [&](std::size_t block_index) {
+        const std::size_t begin_pair = block_index * pairs_per_block;
+        const std::size_t end_pair = std::min(cfg.pair_count, begin_pair + pairs_per_block);
+
+        FastqBlock block;
+        block.pair_count = end_pair - begin_pair;
+        block.read1.reserve(block.pair_count * 360);
+        block.read2.reserve(block.pair_count * 360);
+
+        std::discrete_distribution<std::size_t> contact_dist(weights.begin(), weights.end());
+        std::mt19937_64 rng(cfg.seed + 104729ULL * (block_index + 1));
+        for (std::size_t pair_index = begin_pair; pair_index < end_pair; ++pair_index) {
+            ReadPairTemplate read_pair =
+                sample_one_read_template(cfg, reference, index, matrix, ligation_junction, contact_dist, rng, pair_index);
+            append_simulated_fastq_pair(cfg, read_pair, rng, block.read1, block.read2);
+        }
+        return block;
+    };
+
+    const auto worker = [&]() {
+        try {
+            while (!stop_workers.load()) {
+                const std::size_t block_index = next_block.fetch_add(1);
+                if (block_index >= total_blocks) {
+                    break;
+                }
+                FastqBlock block = make_block(block_index);
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    ready_blocks.emplace(block_index, std::move(block));
+                }
+                cv.notify_one();
+            }
+        } catch (...) {
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                if (!worker_error) {
+                    worker_error = std::current_exception();
+                }
+                stop_workers.store(true);
+            }
+            cv.notify_all();
+        }
+
+        finished_workers.fetch_add(1);
+        cv.notify_all();
+    };
+
+    std::vector<std::thread> workers;
+    workers.reserve(worker_count);
+    for (std::size_t i = 0; i < worker_count; ++i) {
+        workers.emplace_back(worker);
+    }
+
+    std::size_t next_to_write = 0;
+    while (next_to_write < total_blocks) {
+        FastqBlock block;
+        {
+            std::unique_lock<std::mutex> lock(mutex);
+            cv.wait(lock, [&]() {
+                return ready_blocks.find(next_to_write) != ready_blocks.end() ||
+                       worker_error ||
+                       finished_workers.load() == worker_count;
+            });
+
+            auto it = ready_blocks.find(next_to_write);
+            if (it == ready_blocks.end()) {
+                break;
+            }
+            block = std::move(it->second);
+            ready_blocks.erase(it);
+        }
+        writer.write_block(block);
+        ++next_to_write;
+    }
+
+    stop_workers.store(true);
+    cv.notify_all();
+    for (auto &thread : workers) {
+        if (thread.joinable()) {
+            thread.join();
+        }
+    }
+
+    if (worker_error) {
+        std::rethrow_exception(worker_error);
+    }
+    if (next_to_write != total_blocks) {
+        throw std::runtime_error("Read generation stopped before all FASTQ blocks were written.");
+    }
 }

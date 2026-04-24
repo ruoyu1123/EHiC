@@ -9,6 +9,8 @@
 #include <unordered_map>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <vector>
 
 namespace {
 
@@ -47,28 +49,63 @@ double estimate_empirical_fraction(const std::vector<OffsetEntry> &source_offset
 void print_usage() {
     std::cerr 
         << "Usage:\n"
-        << "  hicreate --reference ref.fa [--matrix matrix.tsv] --bin-size 10000\n"
-        << "           [--coverage 30] [--pairs 100000] [--output-prefix sim]\n"
-        << "           [--offset offsets.tsv] [--enzyme-site AAGCTT]\n"
-        << "           [--seed 123]\n"
-        << "           [--trans-ratio 0.10] [--synthetic-contacts 200000]\n"
-        << "           [--cis-decay-alpha 1.0] [--max-cis-distance-bins 200]\n"
-        << "           [--species-model generic_plant] [--arrangement-model auto]\n"
-        << "           [--trans-model auto] [--trans-hotspots 8]\n"
-        << "           [--collision-randomness 0.35]\n\n"
-        << "Output reads:\n"
-        << "  Always writes 150 bp paired-end FASTQ.\n"
-        << "  --coverage X sets read pairs to ceil(X * reference_bases / 300).\n"
-        << "  --pairs is the exact number of read pairs when --coverage is omitted.\n\n"
-        << "Input matrix:\n"
-        << "  Sparse: bin1 bin2 value\n"
-        << "  Dense: headerless square numeric matrix\n\n"
-        << "Offset format:\n"
-        << "  contig start_bin end_bin\n";
+        << "  hicreate ref.fa 10000 [options]\n"
+        << "  hicreate --reference ref.fa --bin-size 10000 [options]\n\n"
+        << "Required positional arguments:\n"
+        << "  ref.fa                 Reference FASTA. No --reference flag is required.\n"
+        << "  10000                  Genomic bin size. No --bin-size flag is required.\n\n"
+        << "Long-form compatibility:\n"
+        << "  -r, --reference FILE   Reference FASTA.\n"
+        << "  -b, --bin-size N       Genomic bin size used by the contact matrix.\n\n"
+        << "Read count options (choose one):\n"
+        << "  -c, --coverage X       Target genome depth. Read pairs are computed as\n"
+        << "                         ceil(X * reference_bases / 300) for PE150 reads.\n"
+        << "      --depth X          Alias for --coverage.\n"
+        << "  -p, --pairs N          Exact number of 150 bp paired-end read pairs.\n"
+        << "                         Default: 100000 when --coverage is omitted.\n"
+        << "                         --coverage and --pairs cannot be used together.\n\n"
+        << "Output and reproducibility:\n"
+        << "  -o, --output-prefix PREFIX\n"
+        << "                         Prefix for output FASTQ files. Default: sim\n"
+        << "  -s, --seed N           Random seed. Default: 1\n"
+        << "  -j, --threads N        Worker threads for read generation. Default: 1\n"
+        << "                         Use 0 to auto-detect hardware threads.\n\n"
+        << "Reference digestion:\n"
+        << "  -e, --enzyme-site SEQ  Restriction enzyme motif. Default: AAGCTT\n"
+        << "                         Common cut offsets are recognized for HindIII (AAGCTT)\n"
+        << "                         and DpnII/MboI (GATC).\n\n"
+        << "Optional input matrix:\n"
+        << "  -m, --matrix FILE      Sparse or dense Hi-C contact matrix. If omitted,\n"
+        << "                         a synthetic matrix is generated from the reference.\n"
+        << "  -f, --offset FILE      Optional matrix bin-to-contig mapping.\n"
+        << "                         Format: contig start_bin end_bin\n"
+        << "  Sparse matrix format:  bin1 bin2 value\n"
+        << "  Dense matrix format:   headerless square numeric matrix\n\n"
+        << "Synthetic contact model:\n"
+        << "  -t, --trans-ratio X    Fraction of trans-chromosomal contact mass. Default: 0.10\n"
+        << "  --synthetic-contacts N Number of sparse contacts in synthetic matrix. Default: auto\n"
+        << "  --cis-decay-alpha X    Cis distance-decay exponent. Default: 1.0\n"
+        << "  --max-cis-distance-bins N\n"
+        << "                         Maximum cis separation sampled for synthetic contacts.\n"
+        << "                         Default: 200\n"
+        << "  -S, --species-model NAME\n"
+        << "                         Preset: generic_plant, human, arabidopsis, rice,\n"
+        << "                         maize, wheat, barley. Default: generic_plant\n"
+        << "  -A, --arrangement-model M\n"
+        << "                         auto, territory, rabl, rosette, nonrabl. Default: auto\n"
+        << "  -T, --trans-model M    auto, territory, random, telomere, compartment, hubs.\n"
+        << "                         Default: auto\n"
+        << "  --trans-hotspots N     Number of hub bins for --trans-model hubs. Default: 8\n"
+        << "  --collision-randomness X\n"
+        << "                         Mix between random collision and arrangement effects.\n"
+        << "                         Range: 0..1, default: 0.35\n\n"
+        << "Output:\n"
+        << "  PREFIX_R1.fastq and PREFIX_R2.fastq, always 150 bp paired-end reads.\n";
 }
 
 Config parse_args(int argc, char **argv) {
     Config cfg;
+    std::vector<std::string> positional_args;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -79,28 +116,30 @@ Config parse_args(int argc, char **argv) {
             return argv[++i];
         };
 
-        if (arg == "--reference") {
+        if (arg == "--reference" || arg == "-r") {
             cfg.reference_path = require_value(arg);
-        } else if (arg == "--matrix") {
+        } else if (arg == "--matrix" || arg == "-m") {
             cfg.matrix_path = require_value(arg);
-        } else if (arg == "--output-prefix") {
+        } else if (arg == "--output-prefix" || arg == "-o") {
             cfg.output_prefix = require_value(arg);
-        } else if (arg == "--offset") {
+        } else if (arg == "--offset" || arg == "-f") {
             cfg.offset_path = require_value(arg);
-        } else if (arg == "--enzyme-site") {
+        } else if (arg == "--enzyme-site" || arg == "-e") {
             cfg.enzyme_site = require_value(arg);
-        } else if (arg == "--bin-size") {
+        } else if (arg == "--bin-size" || arg == "-b") {
             cfg.bin_size = std::stoull(require_value(arg));
         } else if (arg == "--read-length") {
             cfg.read_length = std::stoull(require_value(arg));
-        } else if (arg == "--pairs") {
+        } else if (arg == "--pairs" || arg == "-p") {
             cfg.pair_count = std::stoull(require_value(arg));
             cfg.pair_count_explicit = true;
-        } else if (arg == "--coverage" || arg == "--depth") {
+        } else if (arg == "--coverage" || arg == "--depth" || arg == "-c") {
             cfg.coverage_depth = std::stod(require_value(arg));
-        } else if (arg == "--seed") {
+        } else if (arg == "--seed" || arg == "-s") {
             cfg.seed = std::stoull(require_value(arg));
-        } else if (arg == "--trans-ratio") {
+        } else if (arg == "--threads" || arg == "-j") {
+            cfg.thread_count = std::stoull(require_value(arg));
+        } else if (arg == "--trans-ratio" || arg == "-t") {
             cfg.trans_ratio = std::stod(require_value(arg));
         } else if (arg == "--synthetic-contacts") {
             cfg.synthetic_contact_count = std::stoull(require_value(arg));
@@ -108,11 +147,11 @@ Config parse_args(int argc, char **argv) {
             cfg.cis_decay_alpha = std::stod(require_value(arg));
         } else if (arg == "--max-cis-distance-bins") {
             cfg.max_cis_distance_bins = std::stoull(require_value(arg));
-        } else if (arg == "--species-model") {
+        } else if (arg == "--species-model" || arg == "-S") {
             cfg.species_model = require_value(arg);
-        } else if (arg == "--arrangement-model") {
+        } else if (arg == "--arrangement-model" || arg == "-A") {
             cfg.arrangement_model = require_value(arg);
-        } else if (arg == "--trans-model") {
+        } else if (arg == "--trans-model" || arg == "-T") {
             cfg.trans_model = require_value(arg);
         } else if (arg == "--trans-hotspots") {
             cfg.trans_hotspots = std::stoull(require_value(arg));
@@ -121,8 +160,27 @@ Config parse_args(int argc, char **argv) {
         } else if (arg == "--help" || arg == "-h") {
             print_usage();
             std::exit(0);
+        } else if (!arg.empty() && arg[0] != '-') {
+            positional_args.push_back(arg);
         } else {
             throw std::runtime_error("Unknown argument: " + arg);
+        }
+    }
+
+    if (!positional_args.empty()) {
+        if (positional_args.size() > 2) {
+            throw std::runtime_error("Too many positional arguments. Use: hicreate ref.fa bin_size [options].");
+        }
+        for (const auto &value : positional_args) {
+            if (cfg.reference_path.empty()) {
+                cfg.reference_path = value;
+                continue;
+            }
+            if (cfg.bin_size == 0) {
+                cfg.bin_size = std::stoull(value);
+                continue;
+            }
+            throw std::runtime_error("Unexpected positional argument: " + value);
         }
     }
 
@@ -147,6 +205,9 @@ Config parse_args(int argc, char **argv) {
     if (cfg.coverage_depth == 0.0 && cfg.pair_count == 0) {
         throw std::runtime_error("--pairs must be positive when --coverage is omitted.");
     }
+    if (cfg.thread_count == 0) {
+        cfg.thread_count = std::max<unsigned int>(1, std::thread::hardware_concurrency());
+    }
     if (cfg.trans_ratio < 0.0 || cfg.trans_ratio > 1.0) {
         throw std::runtime_error("--trans-ratio must be within [0, 1].");
     }
@@ -165,7 +226,10 @@ Config parse_args(int argc, char **argv) {
 int main(int argc, char **argv) {
     try {
         Config cfg = parse_args(argc, argv);
+        std::cerr << "Loading reference: " << cfg.reference_path << '\n';
         const ReferenceGenome reference = load_reference_fasta(cfg.reference_path);
+        std::cerr << "Reference loaded: " << reference.contigs.size()
+                  << " contigs, " << reference.total_length() << " bp\n";
         if (cfg.read_length >= reference.total_length()) {
             throw std::runtime_error("Read length must be shorter than the total reference length.");
         }
@@ -180,6 +244,7 @@ int main(int argc, char **argv) {
         if (total_bins == 0) {
             throw std::runtime_error("Reference produced zero bins.");
         }
+        std::cerr << "Global bins: " << total_bins << '\n';
 
         const std::vector<OffsetEntry> reference_offsets = build_reference_offsets(reference, cfg.bin_size);
         std::vector<OffsetEntry> source_offsets;
@@ -200,6 +265,7 @@ int main(int argc, char **argv) {
         model_options.seed = cfg.seed;
 
         if (!cfg.matrix_path.empty()) {
+            std::cerr << "Loading and remapping input matrix: " << cfg.matrix_path << '\n';
             const ContactMatrix source_matrix = load_matrix(cfg.matrix_path, 0);
             const ContactMatrix remapped_matrix =
                 remap_matrix_to_reference(source_matrix, source_offsets, reference_offsets);
@@ -225,24 +291,31 @@ int main(int argc, char **argv) {
             std::size_t synthetic_contacts = cfg.synthetic_contact_count;
             if (synthetic_contacts == 0) {
                 synthetic_contacts = std::max<std::size_t>(
-                    20000, std::min<std::size_t>(2000000, cfg.pair_count * 20));
+                    20000, std::min<std::size_t>(2000000, total_bins * 10));
             }
+            std::cerr << "Generating synthetic contact matrix with "
+                      << synthetic_contacts << " sampled contacts...\n";
             matrix = generate_synthetic_matrix(total_bins,
                                               reference_offsets,
                                               synthetic_contacts,
                                               model_options);
         }
-        const auto read_templates = create_hic_read_templates(cfg, reference, reference_offsets, matrix);
-        simulate_paired_reads(cfg, read_templates);
+        std::cerr << "Contact matrix ready: " << matrix.contacts.size() << " sparse contacts\n";
+        std::cerr << "Streaming " << cfg.pair_count << " read pairs to FASTQ with "
+                  << cfg.thread_count << " worker thread(s)...\n";
+        PairedReadWriter writer(cfg);
+        write_hic_reads(cfg, reference, reference_offsets, matrix, writer);
 
         std::cout << "Contigs: " << reference.contigs.size() << '\n'
                   << "Reference length: " << reference.total_length() << '\n'
                   << "Global bins: " << total_bins << '\n'
                   << "Contacts loaded: " << matrix.contacts.size() << '\n'
-                  << "Read pairs: " << read_templates.size() << '\n'
-                  << "Coverage: " << (static_cast<double>(read_templates.size() * 2 * cfg.read_length) /
+                  << "Read pairs: " << writer.count() << '\n'
+                  << "Coverage: " << (static_cast<double>(writer.count() * 2 * cfg.read_length) /
                                       static_cast<double>(reference.total_length())) << "x\n"
-                  << "Read length: " << cfg.read_length << '\n';
+                  << "Read length: " << cfg.read_length << '\n'
+                  << "Output FASTQ R1: " << writer.read1_path() << '\n'
+                  << "Output FASTQ R2: " << writer.read2_path() << '\n';
     } catch (const std::exception &ex) {
         std::cerr << "Error: " << ex.what() << '\n';
         print_usage();
