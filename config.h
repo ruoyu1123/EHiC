@@ -17,10 +17,11 @@ struct Config {
     double coverage_depth = 0.0;
     std::uint64_t seed = 1;
     double trans_ratio = 0.10;
+    bool trans_ratio_explicit = false;
     std::size_t synthetic_contact_count = 0;
     double cis_decay_alpha = 1.0;
     std::size_t max_cis_distance_bins = 200;
-    std::string species_model = "generic_plant";
+    std::string species_model = "auto";
     std::string arrangement_model = "auto";
     std::string trans_model = "auto";
     std::size_t trans_hotspots = 8;

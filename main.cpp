@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cmath>
 #include <iostream>
+#include <limits>
 #include <unordered_map>
 #include <stdexcept>
 #include <string>
@@ -44,6 +45,42 @@ double estimate_empirical_fraction(const std::vector<OffsetEntry> &source_offset
 
     const double fraction = static_cast<double>(matched_bins) / static_cast<double>(total_target_bins);
     return std::max(0.0, std::min(1.0, fraction));
+}
+
+struct ContactMatrixStats {
+    std::size_t cis_contacts = 0;
+    std::size_t trans_contacts = 0;
+    double cis_weight = 0.0;
+    double trans_weight = 0.0;
+};
+
+ContactMatrixStats summarize_matrix(const ContactMatrix &matrix,
+                                    const std::vector<OffsetEntry> &offsets) {
+    std::vector<int> bin_to_contig(matrix.bin_count, -1);
+    for (std::size_t i = 0; i < offsets.size(); ++i) {
+        const std::size_t end_bin = std::min(offsets[i].end_bin, matrix.bin_count);
+        for (std::size_t bin = offsets[i].start_bin; bin < end_bin; ++bin) {
+            bin_to_contig[bin] = static_cast<int>(i);
+        }
+    }
+
+    ContactMatrixStats stats;
+    for (const auto &contact : matrix.contacts) {
+        if (contact.bin1 >= matrix.bin_count || contact.bin2 >= matrix.bin_count ||
+            !std::isfinite(contact.weight) || contact.weight <= 0.0) {
+            continue;
+        }
+        const int contig1 = bin_to_contig[contact.bin1];
+        const int contig2 = bin_to_contig[contact.bin2];
+        if (contig1 >= 0 && contig1 == contig2) {
+            ++stats.cis_contacts;
+            stats.cis_weight += contact.weight;
+        } else {
+            ++stats.trans_contacts;
+            stats.trans_weight += contact.weight;
+        }
+    }
+    return stats;
 }
 
 void print_usage() {
@@ -89,11 +126,12 @@ void print_usage() {
         << "                         Maximum cis separation sampled for synthetic contacts.\n"
         << "                         Default: 200\n"
         << "  -S, --species-model NAME\n"
-        << "                         Preset: generic_plant, human, arabidopsis, rice,\n"
-        << "                         maize, wheat, barley. Default: generic_plant\n"
+        << "                         Preset: auto, generic_plant, human, arabidopsis,\n"
+        << "                         rice, maize, wheat, barley. Default: auto\n"
         << "  -A, --arrangement-model M\n"
         << "                         auto, territory, rabl, rosette, nonrabl. Default: auto\n"
-        << "  -T, --trans-model M    auto, territory, random, telomere, compartment, hubs.\n"
+        << "  -T, --trans-model M    auto, territory, random, telomere, centromere,\n"
+        << "                         compartment, hubs.\n"
         << "                         Default: auto\n"
         << "  --trans-hotspots N     Number of hub bins for --trans-model hubs. Default: 8\n"
         << "  --collision-randomness X\n"
@@ -141,6 +179,7 @@ Config parse_args(int argc, char **argv) {
             cfg.thread_count = std::stoull(require_value(arg));
         } else if (arg == "--trans-ratio" || arg == "-t") {
             cfg.trans_ratio = std::stod(require_value(arg));
+            cfg.trans_ratio_explicit = true;
         } else if (arg == "--synthetic-contacts") {
             cfg.synthetic_contact_count = std::stoull(require_value(arg));
         } else if (arg == "--cis-decay-alpha") {
@@ -255,6 +294,7 @@ int main(int argc, char **argv) {
         ContactMatrix matrix;
         SyntheticModelOptions model_options;
         model_options.trans_ratio = cfg.trans_ratio;
+        model_options.trans_ratio_explicit = cfg.trans_ratio_explicit;
         model_options.cis_decay_alpha = cfg.cis_decay_alpha;
         model_options.max_cis_distance_bins = cfg.max_cis_distance_bins;
         model_options.species_model = cfg.species_model;
@@ -301,6 +341,18 @@ int main(int argc, char **argv) {
                                               model_options);
         }
         std::cerr << "Contact matrix ready: " << matrix.contacts.size() << " sparse contacts\n";
+        const ContactMatrixStats matrix_stats = summarize_matrix(matrix, reference_offsets);
+        const double matrix_weight_total = matrix_stats.cis_weight + matrix_stats.trans_weight;
+        if (matrix_weight_total > std::numeric_limits<double>::min()) {
+            std::cerr << "Matrix cis/trans: "
+                      << matrix_stats.cis_contacts << " cis contacts, "
+                      << matrix_stats.trans_contacts << " trans contacts; "
+                      << "weight fractions cis="
+                      << (matrix_stats.cis_weight / matrix_weight_total)
+                      << ", trans="
+                      << (matrix_stats.trans_weight / matrix_weight_total)
+                      << '\n';
+        }
         std::cerr << "Streaming " << cfg.pair_count << " read pairs to FASTQ with "
                   << cfg.thread_count << " worker thread(s)...\n";
         PairedReadWriter writer(cfg);

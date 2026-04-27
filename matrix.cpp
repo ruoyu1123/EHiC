@@ -139,6 +139,7 @@ enum class TransModel {
     Territory,
     Random,
     Telomere,
+    Centromere,
     Compartment,
     Hubs
 };
@@ -177,6 +178,11 @@ struct Vec3 {
 
 SpeciesProfile species_profile_for(const std::string &species_model) {
     const std::string species = to_lower(species_model);
+    if (species == "auto") {
+        return SpeciesProfile{
+            ArrangementMode::Territory, 0.08, 1.05, 0.25, 0.0, 0.0, 0.08, 1.35
+        };
+    }
     if (species == "human" || species == "homo_sapiens" || species == "mammal") {
         return SpeciesProfile{
             ArrangementMode::Territory, 0.08, 1.05, 0.25, 0.0, 0.0, 0.08, 1.35
@@ -239,7 +245,8 @@ TransModel parse_trans_model(const std::string &trans_model,
             return TransModel::Telomere;
         }
         const std::string species = to_lower(species_model);
-        if (species == "human" || species == "homo_sapiens" || species == "mouse" || species == "mammal") {
+        if (species == "auto" || species == "human" || species == "homo_sapiens" ||
+            species == "mouse" || species == "mammal") {
             return TransModel::Compartment;
         }
         return TransModel::Territory;
@@ -252,6 +259,9 @@ TransModel parse_trans_model(const std::string &trans_model,
     }
     if (model == "telomere" || model == "subtelomere" || model == "rabl") {
         return TransModel::Telomere;
+    }
+    if (model == "centromere" || model == "pericentromere" || model == "chromocenter") {
+        return TransModel::Centromere;
     }
     if (model == "compartment" || model == "ab" || model == "a-b") {
         return TransModel::Compartment;
@@ -277,8 +287,7 @@ ResolvedSyntheticOptions resolve_synthetic_options(const SyntheticModelOptions &
     ResolvedSyntheticOptions resolved;
     resolved.arrangement = parse_arrangement(options.arrangement_model, profile.arrangement);
     resolved.trans_model = parse_trans_model(options.trans_model, resolved.arrangement, options.species_model);
-    resolved.trans_ratio =
-        std::abs(options.trans_ratio - 0.10) < 1e-12 ? profile.default_trans_ratio : options.trans_ratio;
+    resolved.trans_ratio = options.trans_ratio_explicit ? options.trans_ratio : profile.default_trans_ratio;
     resolved.cis_decay_alpha =
         std::abs(options.cis_decay_alpha - 1.0) < 1e-12 ? profile.default_cis_decay_alpha : options.cis_decay_alpha;
     resolved.collision_randomness =
@@ -452,6 +461,19 @@ std::size_t sample_telomeric_bin(const OffsetEntry &offset, std::mt19937_64 &rng
     return (offset.end_bin - 1) - edge_dist(rng);
 }
 
+std::size_t sample_centromeric_bin(const OffsetEntry &offset, std::mt19937_64 &rng) {
+    const std::size_t span = offset.end_bin - offset.start_bin;
+    if (span <= 1) {
+        return offset.start_bin;
+    }
+    const std::size_t center = offset.start_bin + span / 2;
+    const std::size_t half_window = std::max<std::size_t>(1, span / 20);
+    const std::size_t lo = center > half_window ? center - half_window : offset.start_bin;
+    const std::size_t hi = std::min(offset.end_bin - 1, center + half_window);
+    std::uniform_int_distribution<std::size_t> center_dist(lo, hi);
+    return center_dist(rng);
+}
+
 std::size_t sample_compartment_bin(const OffsetEntry &offset, int target_compartment, std::mt19937_64 &rng) {
     for (int attempt = 0; attempt < 16; ++attempt) {
         const std::size_t candidate = sample_uniform_bin(offset, rng);
@@ -529,6 +551,10 @@ std::pair<std::size_t, std::size_t> sample_trans_contact(const std::vector<Offse
 
     if (options.trans_model == TransModel::Telomere) {
         return {sample_telomeric_bin(left_offset, rng), sample_telomeric_bin(right_offset, rng)};
+    }
+
+    if (options.trans_model == TransModel::Centromere) {
+        return {sample_centromeric_bin(left_offset, rng), sample_centromeric_bin(right_offset, rng)};
     }
 
     if (options.trans_model == TransModel::Compartment) {

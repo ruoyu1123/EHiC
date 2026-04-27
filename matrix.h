@@ -24,9 +24,10 @@ struct ContactMatrix {
 
 struct SyntheticModelOptions {
     double trans_ratio = 0.10;
+    bool trans_ratio_explicit = false;
     double cis_decay_alpha = 1.0;
     std::size_t max_cis_distance_bins = 200;
-    std::string species_model = "generic_plant";
+    std::string species_model = "auto";
     std::string arrangement_model = "auto";
     std::string trans_model = "auto";
     std::size_t trans_hotspots = 8;

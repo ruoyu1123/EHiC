@@ -5,6 +5,7 @@
 #include <cctype>
 #include <condition_variable>
 #include <exception>
+#include <cmath>
 #include <map>
 #include <mutex>
 #include <random>
@@ -86,37 +87,25 @@ void append_prefix(std::string &out, const std::string &sequence, std::size_t ta
     out.append(sequence, 0, std::min(remaining, sequence.size()));
 }
 
-void prepend_suffix(std::string &out, const std::string &sequence, std::size_t target_length) {
-    if (out.size() >= target_length) {
-        return;
-    }
-    const std::size_t remaining = target_length - out.size();
-    const std::size_t take = std::min(remaining, sequence.size());
-    out.insert(0, sequence.substr(sequence.size() - take, take));
-}
-
-struct OrientedFragmentEnds {
-    std::string prefix;
-    std::string suffix;
+struct FragmentEndTemplate {
+    std::string outward;
 };
 
-OrientedFragmentEnds get_oriented_fragment_ends(const ReferenceGenome &reference,
-                                                const RestrictionFragment &fragment,
-                                                bool reverse_orientation,
-                                                std::size_t read_length) {
+FragmentEndTemplate get_fragment_end_template(const ReferenceGenome &reference,
+                                              const RestrictionFragment &fragment,
+                                              bool use_right_end,
+                                              std::size_t read_length) {
     const std::size_t fragment_length = fragment.end - fragment.start;
     const std::size_t take = std::min(fragment_length, read_length);
-    const std::string forward_prefix =
-        reference_slice(reference, fragment, fragment.start, fragment.start + take);
-    const std::string forward_suffix =
-        reference_slice(reference, fragment, fragment.end - take, fragment.end);
-
-    if (!reverse_orientation) {
-        return OrientedFragmentEnds{forward_prefix, forward_suffix};
+    if (!use_right_end) {
+        return FragmentEndTemplate{
+            reference_slice(reference, fragment, fragment.start, fragment.start + take)
+        };
     }
 
-    return OrientedFragmentEnds{reverse_complement(forward_suffix),
-                                reverse_complement(forward_prefix)};
+    return FragmentEndTemplate{
+        reverse_complement(reference_slice(reference, fragment, fragment.end - take, fragment.end))
+    };
 }
 
 std::vector<RestrictionFragment> digest_contig(const Contig &contig,
@@ -243,27 +232,57 @@ std::vector<double> build_contact_sampling_weights(const ContactMatrix &matrix,
     return weights;
 }
 
+struct CumulativeWeights {
+    std::vector<double> cumulative;
+    double total = 0.0;
+};
+
+CumulativeWeights build_cumulative_weights(const std::vector<double> &weights) {
+    CumulativeWeights result;
+    result.cumulative.reserve(weights.size());
+    for (const double weight : weights) {
+        if (std::isfinite(weight) && weight > 0.0) {
+            result.total += weight;
+        }
+        result.cumulative.push_back(result.total);
+    }
+    if (result.total <= 0.0) {
+        throw std::runtime_error("Contact matrix does not contain positive usable weights.");
+    }
+    return result;
+}
+
+std::size_t sample_contact_index(const CumulativeWeights &weights, std::mt19937_64 &rng) {
+    std::uniform_real_distribution<double> dist(0.0, weights.total);
+    const double value = dist(rng);
+    const auto it = std::upper_bound(weights.cumulative.begin(), weights.cumulative.end(), value);
+    if (it == weights.cumulative.end()) {
+        return weights.cumulative.size() - 1;
+    }
+    return static_cast<std::size_t>(std::distance(weights.cumulative.begin(), it));
+}
+
 ReadPairTemplate make_read_template(const std::string &name,
-                                    const OrientedFragmentEnds &left,
+                                    const FragmentEndTemplate &left,
                                     const std::string &ligation_junction,
-                                    const OrientedFragmentEnds &right,
+                                    const FragmentEndTemplate &right,
                                     std::size_t read_length) {
     std::string read1_template;
     read1_template.reserve(read_length);
-    append_prefix(read1_template, left.prefix, read_length);
+    append_prefix(read1_template, left.outward, read_length);
     append_prefix(read1_template, ligation_junction, read_length);
-    append_prefix(read1_template, right.prefix, read_length);
+    append_prefix(read1_template, right.outward, read_length);
 
-    std::string read2_insert_suffix;
-    read2_insert_suffix.reserve(read_length);
-    prepend_suffix(read2_insert_suffix, right.suffix, read_length);
-    prepend_suffix(read2_insert_suffix, ligation_junction, read_length);
-    prepend_suffix(read2_insert_suffix, left.suffix, read_length);
+    std::string read2_template;
+    read2_template.reserve(read_length);
+    append_prefix(read2_template, right.outward, read_length);
+    append_prefix(read2_template, ligation_junction, read_length);
+    append_prefix(read2_template, left.outward, read_length);
 
     return ReadPairTemplate{
         name,
         pad_to_length(read1_template, read_length),
-        pad_to_length(reverse_complement(read2_insert_suffix), read_length)
+        pad_to_length(read2_template, read_length)
     };
 }
 
@@ -272,10 +291,10 @@ ReadPairTemplate sample_one_read_template(const Config &cfg,
                                           const FragmentSamplingIndex &index,
                                           const ContactMatrix &matrix,
                                           const std::string &ligation_junction,
-                                          std::discrete_distribution<std::size_t> &contact_dist,
+                                          const CumulativeWeights &contact_weights,
                                           std::mt19937_64 &rng,
                                           std::size_t pair_index) {
-    const Contact &contact = matrix.contacts[contact_dist(rng)];
+    const Contact &contact = matrix.contacts[sample_contact_index(contact_weights, rng)];
     const auto &left_candidates = index.bin_to_fragments[contact.bin1];
     const auto &right_candidates = index.bin_to_fragments[contact.bin2];
     std::uniform_int_distribution<std::size_t> left_dist(0, left_candidates.size() - 1);
@@ -290,12 +309,12 @@ ReadPairTemplate sample_one_read_template(const Config &cfg,
     }
     const RestrictionFragment &right = index.fragments[right_index];
 
-    const bool reverse_left = std::uniform_int_distribution<int>(0, 1)(rng) == 1;
-    const bool reverse_right = std::uniform_int_distribution<int>(0, 1)(rng) == 1;
-    const OrientedFragmentEnds left_ends =
-        get_oriented_fragment_ends(reference, left, reverse_left, cfg.read_length);
-    const OrientedFragmentEnds right_ends =
-        get_oriented_fragment_ends(reference, right, reverse_right, cfg.read_length);
+    const bool use_left_right_end = std::uniform_int_distribution<int>(0, 1)(rng) == 1;
+    const bool use_right_right_end = std::uniform_int_distribution<int>(0, 1)(rng) == 1;
+    const FragmentEndTemplate left_ends =
+        get_fragment_end_template(reference, left, use_left_right_end, cfg.read_length);
+    const FragmentEndTemplate right_ends =
+        get_fragment_end_template(reference, right, use_right_right_end, cfg.read_length);
 
     const std::string name = "hicreate_" + std::to_string(pair_index + 1) +
                              "_bin" + std::to_string(contact.bin1) +
@@ -313,12 +332,12 @@ void sample_hic_read_templates(const Config &cfg,
     const std::size_t cut_offset = infer_cut_offset(cfg.enzyme_site);
     const std::string ligation_junction = build_ligation_junction(cfg.enzyme_site, cut_offset);
     const std::vector<double> weights = build_contact_sampling_weights(matrix, index.bin_to_fragments);
+    const CumulativeWeights contact_weights = build_cumulative_weights(weights);
 
-    std::discrete_distribution<std::size_t> contact_dist(weights.begin(), weights.end());
     std::mt19937_64 rng(cfg.seed + 1);
 
     for (std::size_t i = 0; i < cfg.pair_count; ++i) {
-        emit(sample_one_read_template(cfg, reference, index, matrix, ligation_junction, contact_dist, rng, i));
+        emit(sample_one_read_template(cfg, reference, index, matrix, ligation_junction, contact_weights, rng, i));
     }
 }
 
@@ -333,20 +352,21 @@ void write_hic_reads(const Config &cfg,
     const std::size_t cut_offset = infer_cut_offset(cfg.enzyme_site);
     const std::string ligation_junction = build_ligation_junction(cfg.enzyme_site, cut_offset);
     const std::vector<double> weights = build_contact_sampling_weights(matrix, index.bin_to_fragments);
+    const CumulativeWeights contact_weights = build_cumulative_weights(weights);
 
     const std::size_t worker_count = std::max<std::size_t>(1, cfg.thread_count);
     if (worker_count == 1 || cfg.pair_count < 20000) {
-        std::discrete_distribution<std::size_t> contact_dist(weights.begin(), weights.end());
         std::mt19937_64 rng(cfg.seed + 1);
         for (std::size_t i = 0; i < cfg.pair_count; ++i) {
             writer.write_template(
-                sample_one_read_template(cfg, reference, index, matrix, ligation_junction, contact_dist, rng, i));
+                sample_one_read_template(cfg, reference, index, matrix, ligation_junction, contact_weights, rng, i));
         }
         return;
     }
 
     constexpr std::size_t pairs_per_block = 8192;
     const std::size_t total_blocks = (cfg.pair_count + pairs_per_block - 1) / pairs_per_block;
+    const std::size_t max_ready_blocks = worker_count * 2 + 2;
     std::atomic<std::size_t> next_block{0};
     std::atomic<std::size_t> finished_workers{0};
     std::atomic<bool> stop_workers{false};
@@ -364,11 +384,10 @@ void write_hic_reads(const Config &cfg,
         block.read1.reserve(block.pair_count * 360);
         block.read2.reserve(block.pair_count * 360);
 
-        std::discrete_distribution<std::size_t> contact_dist(weights.begin(), weights.end());
         std::mt19937_64 rng(cfg.seed + 104729ULL * (block_index + 1));
         for (std::size_t pair_index = begin_pair; pair_index < end_pair; ++pair_index) {
             ReadPairTemplate read_pair =
-                sample_one_read_template(cfg, reference, index, matrix, ligation_junction, contact_dist, rng, pair_index);
+                sample_one_read_template(cfg, reference, index, matrix, ligation_junction, contact_weights, rng, pair_index);
             append_simulated_fastq_pair(cfg, read_pair, rng, block.read1, block.read2);
         }
         return block;
@@ -383,7 +402,13 @@ void write_hic_reads(const Config &cfg,
                 }
                 FastqBlock block = make_block(block_index);
                 {
-                    std::lock_guard<std::mutex> lock(mutex);
+                    std::unique_lock<std::mutex> lock(mutex);
+                    cv.wait(lock, [&]() {
+                        return stop_workers.load() || ready_blocks.size() < max_ready_blocks;
+                    });
+                    if (stop_workers.load()) {
+                        break;
+                    }
                     ready_blocks.emplace(block_index, std::move(block));
                 }
                 cv.notify_one();
@@ -427,6 +452,7 @@ void write_hic_reads(const Config &cfg,
             block = std::move(it->second);
             ready_blocks.erase(it);
         }
+        cv.notify_all();
         writer.write_block(block);
         ++next_to_write;
     }

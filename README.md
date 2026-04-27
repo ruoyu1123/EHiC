@@ -42,7 +42,7 @@ hicreate ref.fa 1000 \
          [--offset offset.tsv] [--enzyme-site AAGCTT] [--seed 42] [--threads 4] \
          [--trans-ratio 0.10] [--synthetic-contacts 200000] \
          [--cis-decay-alpha 1.0] [--max-cis-distance-bins 200] \
-         [--species-model generic_plant] [--arrangement-model auto] \
+         [--species-model auto] [--arrangement-model auto] \
          [--trans-model auto] [--trans-hotspots 8] \
          [--collision-randomness 0.35]
 ```
@@ -72,9 +72,9 @@ Optional arguments:
 - `--synthetic-contacts`: number of sparse contacts used to build synthetic matrix (auto if omitted)
 - `--cis-decay-alpha`: cis distance-decay exponent (default `1.0`)
 - `--max-cis-distance-bins`: max cis bin separation for synthetic matrix (default `200`)
-- `-S`, `--species-model`: synthetic matrix species preset (`generic_plant`, `human`, `arabidopsis`, `rice`, `maize`, `wheat`, `barley`)
+- `-S`, `--species-model`: synthetic matrix species preset (`auto`, `generic_plant`, `human`, `arabidopsis`, `rice`, `maize`, `wheat`, `barley`)
 - `-A`, `--arrangement-model`: chromosome arrangement override (`auto`, `territory`, `rabl`, `rosette`, `nonrabl`)
-- `-T`, `--trans-model`: trans interaction style (`auto`, `territory`, `random`, `telomere`, `compartment`, `hubs`)
+- `-T`, `--trans-model`: trans interaction style (`auto`, `territory`, `random`, `telomere`, `centromere`, `compartment`, `hubs`)
 - `--trans-hotspots`: number of trans hub bins for `--trans-model hubs`, default `8`
 - `--collision-randomness`: random collision baseline in trans sampling (0-1, default `0.35`)
 
@@ -155,6 +155,7 @@ If `--coverage` is provided, it replaces `--pairs` and computes the FASTQ record
   - `territory` trans contacts emphasize chromosome-size and nuclear-distance effects
   - `random` trans contacts provide a uniform collision background
   - `telomere` trans contacts enrich different-chromosome telomere/subtelomere bins
+  - `centromere` trans contacts enrich approximate pericentromeric/chromocenter-like bins
   - `compartment` trans contacts enrich same synthetic A/B-like compartment bins across chromosomes
   - `hubs` trans contacts create several point-like interchromosomal hot spots
   - species-aware defaults include chromosome arrangement effects (`Rabl`, `Rosette`, or territory-like)
@@ -162,7 +163,8 @@ If `--coverage` is provided, it replaces `--pairs` and computes the FASTQ record
 - Restriction digestion is modeled explicitly from the reference sequence.
 - Common enzyme cut offsets are recognized for motifs such as HindIII and DpnII/MboI.
 - Ligation products include an explicit fill-in ligation junction, but the program does not materialize full ligation molecules per read pair.
-- For each sampled ligation event, only the required 150 bp prefixes/suffixes are sliced from the two restriction-fragment coordinates. This is equivalent to generating reads from the two ends of the virtual ligated sequence without copying long fragments.
+- For each sampled ligation event, reads are sliced from the ligated restriction-fragment ends outward. Short fragments are extended across the virtual ligation junction mathematically, without materializing long ligated sequences.
+- Each run reports the matrix cis/trans contact counts and weight fractions before FASTQ generation, which helps diagnose whether an unexpected map comes from the contact model or from downstream alignment/filtering.
 - Read pairs are generated in bounded FASTQ blocks and streamed to disk, so memory does not scale with `--pairs` or `--coverage`.
 - `--threads` parallelizes read-pair sampling, template construction, quality simulation, and FASTQ block formatting; a single writer preserves ordered output and avoids file-write lock contention.
 - FASTQ qualities use an Illumina-like positional profile: high Q values near the start of each read, gradually lower Q values toward the 3' end, and Phred-derived substitution error probabilities.
