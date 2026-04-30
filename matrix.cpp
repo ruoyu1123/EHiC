@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdint>
 #include <fstream>
+#include <iostream>
 #include <limits>
 #include <random>
 #include <sstream>
@@ -149,6 +150,8 @@ struct SpeciesProfile {
     double default_trans_ratio = 0.10;
     double default_cis_decay_alpha = 1.0;
     double default_collision_randomness = 0.35;
+    double cis_diagonal_boost = 2.5;
+    double compartment_strength = 1.0;
     double rabl_arm_bias = 0.0;
     double rosette_center_bias = 0.0;
     double subtelomere_trans_bias = 0.0;
@@ -161,8 +164,11 @@ struct ResolvedSyntheticOptions {
     double trans_ratio = 0.10;
     double cis_decay_alpha = 1.0;
     double collision_randomness = 0.35;
+    std::size_t min_cis_distance_bins = 1;
     std::size_t max_cis_distance_bins = 200;
     std::size_t trans_hotspots = 8;
+    double cis_diagonal_boost = 2.5;
+    double compartment_strength = 1.0;
     double rabl_arm_bias = 0.0;
     double rosette_center_bias = 0.0;
     double subtelomere_trans_bias = 0.0;
@@ -180,37 +186,37 @@ SpeciesProfile species_profile_for(const std::string &species_model) {
     const std::string species = to_lower(species_model);
     if (species == "auto") {
         return SpeciesProfile{
-            ArrangementMode::Territory, 0.08, 1.05, 0.25, 0.0, 0.0, 0.08, 1.35
+            ArrangementMode::Territory, 0.12, 1.15, 0.08, 2.3, 4.0, 0.0, 0.0, 0.05, 1.65
         };
     }
     if (species == "human" || species == "homo_sapiens" || species == "mammal") {
         return SpeciesProfile{
-            ArrangementMode::Territory, 0.08, 1.05, 0.25, 0.0, 0.0, 0.08, 1.35
+            ArrangementMode::Territory, 0.12, 1.15, 0.08, 2.3, 4.0, 0.0, 0.0, 0.05, 1.65
         };
     }
     if (species == "arabidopsis" || species == "athaliana" || species == "arabidopsis_thaliana") {
         return SpeciesProfile{
-            ArrangementMode::Rosette, 0.06, 1.08, 0.30, 0.0, 0.35, 0.05, 1.1
+            ArrangementMode::Rosette, 0.06, 1.08, 0.30, 2.0, 0.35, 0.0, 0.35, 0.05, 1.1
         };
     }
     if (species == "wheat" || species == "triticum" || species == "triticum_aestivum") {
         return SpeciesProfile{
-            ArrangementMode::Rabl, 0.14, 0.95, 0.28, 0.28, 0.0, 0.45, 1.35
+            ArrangementMode::Rabl, 0.14, 0.95, 0.28, 2.0, 0.25, 0.28, 0.0, 0.45, 1.35
         };
     }
     if (species == "barley" || species == "hordeum" || species == "hordeum_vulgare") {
         return SpeciesProfile{
-            ArrangementMode::Rabl, 0.12, 0.95, 0.30, 0.24, 0.0, 0.40, 1.30
+            ArrangementMode::Rabl, 0.12, 0.95, 0.30, 2.0, 0.25, 0.24, 0.0, 0.40, 1.30
         };
     }
     if (species == "rice" || species == "oryza" || species == "oryza_sativa") {
         return SpeciesProfile{
-            ArrangementMode::NonRabl, 0.08, 1.03, 0.36, 0.04, 0.08, 0.10, 1.2
+            ArrangementMode::NonRabl, 0.08, 1.03, 0.36, 2.0, 0.45, 0.04, 0.08, 0.10, 1.2
         };
     }
     if (species == "maize" || species == "zea" || species == "zea_mays") {
         return SpeciesProfile{
-            ArrangementMode::Rabl, 0.11, 1.0, 0.32, 0.16, 0.0, 0.26, 1.25
+            ArrangementMode::Rabl, 0.11, 1.0, 0.32, 2.0, 0.30, 0.16, 0.0, 0.26, 1.25
         };
     }
     return SpeciesProfile{};
@@ -234,6 +240,28 @@ ArrangementMode parse_arrangement(const std::string &arrangement_model, Arrangem
         return ArrangementMode::NonRabl;
     }
     throw std::runtime_error("Unknown arrangement model: " + arrangement_model);
+}
+
+std::string arrangement_name(ArrangementMode arrangement) {
+    switch (arrangement) {
+        case ArrangementMode::Territory: return "territory";
+        case ArrangementMode::Rabl: return "rabl";
+        case ArrangementMode::Rosette: return "rosette";
+        case ArrangementMode::NonRabl: return "nonrabl";
+    }
+    return "unknown";
+}
+
+std::string trans_model_name(TransModel model) {
+    switch (model) {
+        case TransModel::Territory: return "territory";
+        case TransModel::Random: return "random";
+        case TransModel::Telomere: return "telomere";
+        case TransModel::Centromere: return "centromere";
+        case TransModel::Compartment: return "compartment";
+        case TransModel::Hubs: return "hubs";
+    }
+    return "unknown";
 }
 
 TransModel parse_trans_model(const std::string &trans_model,
@@ -292,8 +320,11 @@ ResolvedSyntheticOptions resolve_synthetic_options(const SyntheticModelOptions &
         std::abs(options.cis_decay_alpha - 1.0) < 1e-12 ? profile.default_cis_decay_alpha : options.cis_decay_alpha;
     resolved.collision_randomness =
         std::abs(options.collision_randomness - 0.35) < 1e-12 ? profile.default_collision_randomness : options.collision_randomness;
+    resolved.min_cis_distance_bins = options.min_cis_distance_bins;
     resolved.max_cis_distance_bins = options.max_cis_distance_bins;
     resolved.trans_hotspots = options.trans_hotspots;
+    resolved.cis_diagonal_boost = profile.cis_diagonal_boost;
+    resolved.compartment_strength = profile.compartment_strength;
     resolved.rabl_arm_bias = profile.rabl_arm_bias;
     resolved.rosette_center_bias = profile.rosette_center_bias;
     resolved.subtelomere_trans_bias = profile.subtelomere_trans_bias;
@@ -433,14 +464,34 @@ std::uint64_t contact_key(std::size_t bin1, std::size_t bin2) {
     return (static_cast<std::uint64_t>(lo) << 32U) | static_cast<std::uint64_t>(hi);
 }
 
-int compartment_label(std::size_t global_bin) {
-    std::uint64_t x = static_cast<std::uint64_t>(global_bin / 40 + 0x9e3779b97f4a7c15ULL);
+std::uint64_t stable_hash(std::uint64_t x) {
     x ^= x >> 30U;
     x *= 0xbf58476d1ce4e5b9ULL;
     x ^= x >> 27U;
     x *= 0x94d049bb133111ebULL;
     x ^= x >> 31U;
-    return static_cast<int>(x & 1ULL);
+    return x;
+}
+
+int compartment_label(const OffsetEntry &offset, std::size_t global_bin) {
+    const std::size_t span = offset.end_bin - offset.start_bin;
+    const std::size_t local_bin = global_bin >= offset.start_bin ? global_bin - offset.start_bin : 0;
+    const std::size_t domain_bins = std::max<std::size_t>(1, span / 18);
+    const std::uint64_t domain = static_cast<std::uint64_t>(local_bin / domain_bins);
+    const std::uint64_t salt = stable_hash(static_cast<std::uint64_t>(offset.start_bin + span * 1315423911ULL));
+    return static_cast<int>(stable_hash(domain + salt) & 1ULL);
+}
+
+double compartment_multiplier(const OffsetEntry &left_offset,
+                              std::size_t left_bin,
+                              const OffsetEntry &right_offset,
+                              std::size_t right_bin,
+                              double strength) {
+    if (strength <= 0.0) {
+        return 1.0;
+    }
+    const bool same = compartment_label(left_offset, left_bin) == compartment_label(right_offset, right_bin);
+    return same ? (1.0 + strength) : (1.0 / (1.0 + 0.65 * strength));
 }
 
 std::size_t sample_uniform_bin(const OffsetEntry &offset, std::mt19937_64 &rng) {
@@ -477,7 +528,7 @@ std::size_t sample_centromeric_bin(const OffsetEntry &offset, std::mt19937_64 &r
 std::size_t sample_compartment_bin(const OffsetEntry &offset, int target_compartment, std::mt19937_64 &rng) {
     for (int attempt = 0; attempt < 16; ++attempt) {
         const std::size_t candidate = sample_uniform_bin(offset, rng);
-        if (compartment_label(candidate) == target_compartment) {
+        if (compartment_label(offset, candidate) == target_compartment) {
             return candidate;
         }
     }
@@ -492,6 +543,109 @@ void add_contact_weight(std::unordered_map<std::uint64_t, double> &weights,
         return;
     }
     weights[contact_key(bin1, bin2)] += value;
+}
+
+double cis_contact_multiplier(const OffsetEntry &offset,
+                              std::size_t left_bin,
+                              std::size_t right_bin,
+                              const ResolvedSyntheticOptions &options) {
+    const std::size_t distance = left_bin > right_bin ? left_bin - right_bin : right_bin - left_bin;
+    double multiplier = distance == 0 ? options.cis_diagonal_boost : 1.0;
+    multiplier *= compartment_multiplier(offset, left_bin, offset, right_bin, 0.35 * options.compartment_strength);
+    return multiplier;
+}
+
+double trans_contact_multiplier(const OffsetEntry &left_offset,
+                                std::size_t left_bin,
+                                const OffsetEntry &right_offset,
+                                std::size_t right_bin,
+                                const ResolvedSyntheticOptions &options) {
+    if (options.trans_model == TransModel::Random) {
+        return 1.0;
+    }
+    return compartment_multiplier(left_offset, left_bin, right_offset, right_bin, options.compartment_strength);
+}
+
+void add_human_like_backbone(std::unordered_map<std::uint64_t, double> &weights,
+                             const std::vector<OffsetEntry> &offsets,
+                             const std::vector<Vec3> &centers,
+                             const ResolvedSyntheticOptions &options,
+                             std::size_t bin_count,
+                             double backbone_mass) {
+    if (bin_count > 1200 || backbone_mass <= 0.0) {
+        return;
+    }
+
+    double cis_total = 0.0;
+    for (const auto &offset : offsets) {
+        const std::size_t span = offset.end_bin - offset.start_bin;
+        for (std::size_t local1 = 0; local1 < span; ++local1) {
+            const std::size_t max_distance = std::min(options.max_cis_distance_bins, span - 1 - local1);
+            for (std::size_t distance = options.min_cis_distance_bins; distance <= max_distance; ++distance) {
+                const std::size_t left = offset.start_bin + local1;
+                const std::size_t right = left + distance;
+                const double decay = 1.0 / std::pow(static_cast<double>(distance + 1), options.cis_decay_alpha);
+                cis_total += decay * cis_contact_multiplier(offset, left, right, options);
+            }
+        }
+    }
+
+    double trans_total = 0.0;
+    for (std::size_t i = 0; i < offsets.size(); ++i) {
+        for (std::size_t j = i + 1; j < offsets.size(); ++j) {
+            const double d = std::sqrt(squared_distance(centers[i], centers[j]));
+            const double arranged = 1.0 / std::pow(d + 0.25, options.trans_distance_gamma);
+            const double mixed = options.collision_randomness +
+                                 (1.0 - options.collision_randomness) * arranged;
+            for (std::size_t left = offsets[i].start_bin; left < offsets[i].end_bin; ++left) {
+                for (std::size_t right = offsets[j].start_bin; right < offsets[j].end_bin; ++right) {
+                    trans_total += mixed * trans_contact_multiplier(offsets[i], left, offsets[j], right, options);
+                }
+            }
+        }
+    }
+
+    const double cis_mass = backbone_mass * (1.0 - options.trans_ratio);
+    const double trans_mass = backbone_mass * options.trans_ratio;
+    if (cis_total > 0.0) {
+        const double scale = cis_mass / cis_total;
+        for (const auto &offset : offsets) {
+            const std::size_t span = offset.end_bin - offset.start_bin;
+            for (std::size_t local1 = 0; local1 < span; ++local1) {
+                const std::size_t max_distance = std::min(options.max_cis_distance_bins, span - 1 - local1);
+                for (std::size_t distance = options.min_cis_distance_bins; distance <= max_distance; ++distance) {
+                    const std::size_t left = offset.start_bin + local1;
+                    const std::size_t right = left + distance;
+                    const double decay = 1.0 / std::pow(static_cast<double>(distance + 1), options.cis_decay_alpha);
+                    add_contact_weight(weights,
+                                       left,
+                                       right,
+                                       scale * decay * cis_contact_multiplier(offset, left, right, options));
+                }
+            }
+        }
+    }
+
+    if (trans_total > 0.0) {
+        const double scale = trans_mass / trans_total;
+        for (std::size_t i = 0; i < offsets.size(); ++i) {
+            for (std::size_t j = i + 1; j < offsets.size(); ++j) {
+                const double d = std::sqrt(squared_distance(centers[i], centers[j]));
+                const double arranged = 1.0 / std::pow(d + 0.25, options.trans_distance_gamma);
+                const double mixed = options.collision_randomness +
+                                     (1.0 - options.collision_randomness) * arranged;
+                for (std::size_t left = offsets[i].start_bin; left < offsets[i].end_bin; ++left) {
+                    for (std::size_t right = offsets[j].start_bin; right < offsets[j].end_bin; ++right) {
+                        add_contact_weight(weights,
+                                           left,
+                                           right,
+                                           scale * mixed *
+                                               trans_contact_multiplier(offsets[i], left, offsets[j], right, options));
+                    }
+                }
+            }
+        }
+    }
 }
 
 ContactMatrix finalize_sparse_contacts(std::size_t bin_count,
@@ -894,6 +1048,17 @@ ContactMatrix generate_synthetic_matrix(std::size_t bin_count,
         throw std::runtime_error("Synthetic matrix generation requires contig offsets.");
     }
     const ResolvedSyntheticOptions resolved = resolve_synthetic_options(options);
+    std::cerr << "Synthetic model resolved: species=" << options.species_model
+              << ", arrangement=" << arrangement_name(resolved.arrangement)
+              << ", trans_model=" << trans_model_name(resolved.trans_model)
+              << ", trans_ratio=" << resolved.trans_ratio
+              << ", cis_decay_alpha=" << resolved.cis_decay_alpha
+              << ", cis_distance_bins=" << resolved.min_cis_distance_bins
+              << ".." << resolved.max_cis_distance_bins
+              << ", diagonal_boost=" << resolved.cis_diagonal_boost
+              << ", compartment_strength=" << resolved.compartment_strength
+              << ", collision_randomness=" << resolved.collision_randomness
+              << '\n';
 
     std::vector<OffsetEntry> valid_offsets;
     valid_offsets.reserve(offsets.size());
@@ -925,9 +1090,12 @@ ContactMatrix generate_synthetic_matrix(std::size_t bin_count,
         const std::size_t contig_bins = offset.end_bin - offset.start_bin;
         const std::size_t max_distance =
             contig_bins > 1 ? std::min(resolved.max_cis_distance_bins, contig_bins - 1) : 0;
+        const std::size_t min_distance = std::min(resolved.min_cis_distance_bins, max_distance);
         std::vector<double> distance_weights(max_distance + 1, 1.0);
         for (std::size_t d = 0; d <= max_distance; ++d) {
-            distance_weights[d] = 1.0 / std::pow(static_cast<double>(d + 1), resolved.cis_decay_alpha);
+            distance_weights[d] =
+                d < min_distance ? 0.0
+                                 : 1.0 / std::pow(static_cast<double>(d + 1), resolved.cis_decay_alpha);
         }
         cis_distance_dists.emplace_back(distance_weights.begin(), distance_weights.end());
     }
@@ -972,6 +1140,12 @@ ContactMatrix generate_synthetic_matrix(std::size_t bin_count,
 
     std::unordered_map<std::uint64_t, double> weights;
     weights.reserve(synthetic_contact_count * 2);
+    add_human_like_backbone(weights,
+                            valid_offsets,
+                            centers,
+                            resolved,
+                            bin_count,
+                            static_cast<double>(synthetic_contact_count) * 0.35);
 
     for (std::size_t i = 0; i < synthetic_contact_count; ++i) {
         bool do_trans = use_trans(rng) && valid_offsets.size() > 1;
@@ -984,7 +1158,17 @@ ContactMatrix generate_synthetic_matrix(std::size_t bin_count,
                                      valid_bin_to_contig,
                                      resolved,
                                      rng);
-            add_contact_weight(weights, left, right, 1.0);
+            double value = 1.0;
+            const int left_contig = left < valid_bin_to_contig.size() ? valid_bin_to_contig[left] : -1;
+            const int right_contig = right < valid_bin_to_contig.size() ? valid_bin_to_contig[right] : -1;
+            if (left_contig >= 0 && right_contig >= 0) {
+                value *= trans_contact_multiplier(valid_offsets[static_cast<std::size_t>(left_contig)],
+                                                  left,
+                                                  valid_offsets[static_cast<std::size_t>(right_contig)],
+                                                  right,
+                                                  resolved);
+            }
+            add_contact_weight(weights, left, right, value);
             continue;
         }
 
@@ -993,7 +1177,38 @@ ContactMatrix generate_synthetic_matrix(std::size_t bin_count,
                                                       cis_distance_dists[contig_index],
                                                       resolved,
                                                       rng);
-        add_contact_weight(weights, left, right, 1.0);
+        add_contact_weight(weights,
+                           left,
+                           right,
+                           cis_contact_multiplier(valid_offsets[contig_index], left, right, resolved));
+    }
+
+    double cis_sum = 0.0;
+    double trans_sum = 0.0;
+    for (const auto &[key, weight] : weights) {
+        const std::size_t bin1 = static_cast<std::size_t>(key >> 32U);
+        const std::size_t bin2 = static_cast<std::size_t>(key & 0xffffffffULL);
+        const int contig1 = bin1 < valid_bin_to_contig.size() ? valid_bin_to_contig[bin1] : -1;
+        const int contig2 = bin2 < valid_bin_to_contig.size() ? valid_bin_to_contig[bin2] : -1;
+        if (contig1 >= 0 && contig1 == contig2) {
+            cis_sum += weight;
+        } else {
+            trans_sum += weight;
+        }
+    }
+    const double total_sum = cis_sum + trans_sum;
+    if (total_sum > std::numeric_limits<double>::min()) {
+        const double target_cis = total_sum * (1.0 - resolved.trans_ratio);
+        const double target_trans = total_sum * resolved.trans_ratio;
+        const double cis_scale = cis_sum > 0.0 ? target_cis / cis_sum : 1.0;
+        const double trans_scale = trans_sum > 0.0 ? target_trans / trans_sum : 1.0;
+        for (auto &[key, weight] : weights) {
+            const std::size_t bin1 = static_cast<std::size_t>(key >> 32U);
+            const std::size_t bin2 = static_cast<std::size_t>(key & 0xffffffffULL);
+            const int contig1 = bin1 < valid_bin_to_contig.size() ? valid_bin_to_contig[bin1] : -1;
+            const int contig2 = bin2 < valid_bin_to_contig.size() ? valid_bin_to_contig[bin2] : -1;
+            weight *= (contig1 >= 0 && contig1 == contig2) ? cis_scale : trans_scale;
+        }
     }
 
     return finalize_sparse_contacts(bin_count, weights);

@@ -40,8 +40,9 @@ hicreate ref.fa 1000 \
          [--matrix matrix.tsv] \
          [--coverage X | --pairs 100000] [--output-prefix sim] \
          [--offset offset.tsv] [--enzyme-site AAGCTT] [--seed 42] [--threads 4] \
-         [--trans-ratio 0.10] [--synthetic-contacts 200000] \
-         [--cis-decay-alpha 1.0] [--max-cis-distance-bins 200] \
+         [--trans-ratio 0.12] [--synthetic-contacts 200000] \
+         [--cis-decay-alpha 1.0] [--min-cis-distance-bins 0] \
+         [--max-cis-distance-bins 200] \
          [--species-model auto] [--arrangement-model auto] \
          [--trans-model auto] [--trans-hotspots 8] \
          [--collision-randomness 0.35]
@@ -68,9 +69,10 @@ Optional arguments:
 - `-e`, `--enzyme-site`: restriction enzyme motif, default `AAGCTT`
 - `-s`, `--seed`: random seed
 - `-j`, `--threads`: worker threads for read generation, default `1`; use `0` to auto-detect hardware threads
-- `-t`, `--trans-ratio`: target fraction of trans-chromosomal interaction mass (default `0.10`)
+- `-t`, `--trans-ratio`: target fraction of trans-chromosomal interaction mass (default is species-aware; `auto`/`human` uses `0.12`)
 - `--synthetic-contacts`: number of sparse contacts used to build synthetic matrix (auto if omitted)
 - `--cis-decay-alpha`: cis distance-decay exponent (default `1.0`)
+- `--min-cis-distance-bins`: min cis bin separation for synthetic matrix (default `0`, preserves strong same-bin contacts)
 - `--max-cis-distance-bins`: max cis bin separation for synthetic matrix (default `200`)
 - `-S`, `--species-model`: synthetic matrix species preset (`auto`, `generic_plant`, `human`, `arabidopsis`, `rice`, `maize`, `wheat`, `barley`)
 - `-A`, `--arrangement-model`: chromosome arrangement override (`auto`, `territory`, `rabl`, `rosette`, `nonrabl`)
@@ -151,6 +153,7 @@ If `--coverage` is provided, it replaces `--pairs` and computes the FASTQ record
 - If `--matrix` is provided without `--offset`, the matrix is resized globally to the target genome bin count.
 - If `--matrix` is omitted, a sparse synthetic matrix is generated:
   - cis contacts follow a power-law distance decay (`1/(distance+1)^alpha`)
+  - same-bin cis contacts are preserved by default via `--min-cis-distance-bins 0`, keeping the strong main diagonal expected in binned Hi-C maps
   - trans contacts are sampled across chromosomes according to `--trans-ratio`
   - `territory` trans contacts emphasize chromosome-size and nuclear-distance effects
   - `random` trans contacts provide a uniform collision background

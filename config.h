@@ -20,6 +20,7 @@ struct Config {
     bool trans_ratio_explicit = false;
     std::size_t synthetic_contact_count = 0;
     double cis_decay_alpha = 1.0;
+    std::size_t min_cis_distance_bins = 0;
     std::size_t max_cis_distance_bins = 200;
     std::string species_model = "auto";
     std::string arrangement_model = "auto";

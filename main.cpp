@@ -119,9 +119,13 @@ void print_usage() {
         << "  Sparse matrix format:  bin1 bin2 value\n"
         << "  Dense matrix format:   headerless square numeric matrix\n\n"
         << "Synthetic contact model:\n"
-        << "  -t, --trans-ratio X    Fraction of trans-chromosomal contact mass. Default: 0.10\n"
+        << "  -t, --trans-ratio X    Fraction of trans-chromosomal contact mass.\n"
+        << "                         Default: species-aware auto, human/auto uses 0.12\n"
         << "  --synthetic-contacts N Number of sparse contacts in synthetic matrix. Default: auto\n"
         << "  --cis-decay-alpha X    Cis distance-decay exponent. Default: 1.0\n"
+        << "  --min-cis-distance-bins N\n"
+        << "                         Minimum cis bin separation for synthetic contacts.\n"
+        << "                         Default: 0, preserving strong same-bin contacts.\n"
         << "  --max-cis-distance-bins N\n"
         << "                         Maximum cis separation sampled for synthetic contacts.\n"
         << "                         Default: 200\n"
@@ -184,6 +188,8 @@ Config parse_args(int argc, char **argv) {
             cfg.synthetic_contact_count = std::stoull(require_value(arg));
         } else if (arg == "--cis-decay-alpha") {
             cfg.cis_decay_alpha = std::stod(require_value(arg));
+        } else if (arg == "--min-cis-distance-bins") {
+            cfg.min_cis_distance_bins = std::stoull(require_value(arg));
         } else if (arg == "--max-cis-distance-bins") {
             cfg.max_cis_distance_bins = std::stoull(require_value(arg));
         } else if (arg == "--species-model" || arg == "-S") {
@@ -253,6 +259,9 @@ Config parse_args(int argc, char **argv) {
     if (cfg.cis_decay_alpha <= 0.0) {
         throw std::runtime_error("--cis-decay-alpha must be positive.");
     }
+    if (cfg.min_cis_distance_bins > cfg.max_cis_distance_bins) {
+        throw std::runtime_error("--min-cis-distance-bins cannot exceed --max-cis-distance-bins.");
+    }
     if (cfg.collision_randomness < 0.0 || cfg.collision_randomness > 1.0) {
         throw std::runtime_error("--collision-randomness must be within [0, 1].");
     }
@@ -296,6 +305,7 @@ int main(int argc, char **argv) {
         model_options.trans_ratio = cfg.trans_ratio;
         model_options.trans_ratio_explicit = cfg.trans_ratio_explicit;
         model_options.cis_decay_alpha = cfg.cis_decay_alpha;
+        model_options.min_cis_distance_bins = cfg.min_cis_distance_bins;
         model_options.max_cis_distance_bins = cfg.max_cis_distance_bins;
         model_options.species_model = cfg.species_model;
         model_options.arrangement_model = cfg.arrangement_model;
