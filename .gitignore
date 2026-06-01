@@ -1,6 +1,9 @@
 data/
+.vscode/
+build/
 hicreate
 hicreate.exe
+*exe
 *.o
 *.obj
 *.out

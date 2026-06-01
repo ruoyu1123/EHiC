@@ -5,8 +5,12 @@
 #include "simulator.h"
 #include <algorithm>
 #include <cmath>
+#include <cctype>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <limits>
+#include <sstream>
 #include <unordered_map>
 #include <stdexcept>
 #include <string>
@@ -14,6 +18,126 @@
 #include <vector>
 
 namespace {
+
+std::string to_lower(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(),
+                   [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+    return value;
+}
+
+MatrixFormat parse_matrix_format(const std::string &value) {
+    const std::string format = to_lower(value);
+    if (format == "auto") {
+        return MatrixFormat::Auto;
+    }
+    if (format == "sparse") {
+        return MatrixFormat::Sparse;
+    }
+    if (format == "dense") {
+        return MatrixFormat::Dense;
+    }
+    if (format == "binary" || format == "binary-sparse" || format == "hcm") {
+        return MatrixFormat::BinarySparse;
+    }
+    throw std::runtime_error("--matrix-format must be one of: auto, sparse, dense, binary.");
+}
+
+struct EmpiricalModelSpec {
+    std::string name;
+    std::string matrix_path;
+    std::string offset_path;
+    MatrixFormat matrix_format = MatrixFormat::Auto;
+};
+
+std::vector<std::string> split_manifest_tokens(const std::string &line) {
+    std::string normalized;
+    normalized.reserve(line.size());
+    for (char ch : line) {
+        normalized.push_back(ch == '=' || ch == ',' ? ' ' : ch);
+    }
+    std::istringstream stream(normalized);
+    std::vector<std::string> tokens;
+    std::string token;
+    while (stream >> token) {
+        tokens.push_back(token);
+    }
+    return tokens;
+}
+
+EmpiricalModelSpec load_empirical_model_spec(const std::string &model_name,
+                                             const std::string &model_dir) {
+    namespace fs = std::filesystem;
+    fs::path model_path(model_name);
+    if (!fs::exists(model_path)) {
+        model_path = fs::path(model_dir) / model_name;
+    }
+    if (!fs::exists(model_path)) {
+        throw std::runtime_error("Empirical model not found: " + model_name);
+    }
+
+    fs::path manifest_path = fs::is_directory(model_path)
+                                 ? model_path / "manifest.tsv"
+                                 : model_path;
+    if (!fs::exists(manifest_path)) {
+        throw std::runtime_error("Empirical model manifest not found: " + manifest_path.string());
+    }
+
+    EmpiricalModelSpec spec;
+    spec.name = model_path.stem().string();
+    std::ifstream in(manifest_path);
+    if (!in) {
+        throw std::runtime_error("Failed to open empirical model manifest: " + manifest_path.string());
+    }
+
+    std::string line;
+    while (std::getline(in, line)) {
+        const auto tokens = split_manifest_tokens(line);
+        if (tokens.empty() || tokens[0].empty() || tokens[0][0] == '#') {
+            continue;
+        }
+        if (tokens.size() < 2) {
+            throw std::runtime_error("Model manifest rows must contain key and value.");
+        }
+        const std::string key = to_lower(tokens[0]);
+        const std::string value = tokens[1];
+        if (key == "name") {
+            spec.name = value;
+        } else if (key == "matrix") {
+            spec.matrix_path = (manifest_path.parent_path() / value).string();
+        } else if (key == "offset") {
+            spec.offset_path = (manifest_path.parent_path() / value).string();
+        } else if (key == "format" || key == "matrix-format") {
+            spec.matrix_format = parse_matrix_format(value);
+        }
+    }
+
+    if (spec.matrix_path.empty() || spec.offset_path.empty()) {
+        throw std::runtime_error("Empirical model manifest requires matrix and offset entries.");
+    }
+    return spec;
+}
+
+std::string infer_empirical_model(const Config &cfg) {
+    namespace fs = std::filesystem;
+    if (!cfg.empirical_model.empty()) {
+        return cfg.empirical_model;
+    }
+
+    const std::string species = to_lower(cfg.species_model.empty() ? "auto" : cfg.species_model);
+    if (species == "auto" || species == "human" || species == "homo_sapiens" ||
+        species == "mammal" || species == "chm13") {
+        return "human_cell_40mb";
+    }
+
+    const fs::path direct_model = fs::path(cfg.model_dir) / cfg.species_model;
+    if (fs::exists(direct_model / "manifest.tsv") || fs::exists(direct_model)) {
+        return cfg.species_model;
+    }
+
+    throw std::runtime_error("No empirical matrix model preset is linked to --species-model " +
+                             cfg.species_model +
+                             ". Provide --empirical-model or add models/<species>/manifest.tsv.");
+}
 
 double estimate_empirical_fraction(const std::vector<OffsetEntry> &source_offsets,
                                    const std::vector<OffsetEntry> &target_offsets) {
@@ -111,36 +235,26 @@ void print_usage() {
         << "  -e, --enzyme-site SEQ  Restriction enzyme motif. Default: AAGCTT\n"
         << "                         Common cut offsets are recognized for HindIII (AAGCTT)\n"
         << "                         and DpnII/MboI (GATC).\n\n"
-        << "Optional input matrix:\n"
+        << "Matrix and model options:\n"
         << "  -m, --matrix FILE      Sparse or dense Hi-C contact matrix. If omitted,\n"
-        << "                         a synthetic matrix is generated from the reference.\n"
+        << "                         the empirical model linked to --species-model is used.\n"
+        << "      --matrix-format F  Matrix parser: auto, sparse, dense, or binary. Default: auto\n"
+        << "      --empirical-model NAME|MANIFEST\n"
+        << "                         Matrix model from --model-dir. Without --matrix, use it\n"
+        << "                         as the full matrix. With --matrix, keep input cis and\n"
+        << "                         replace trans with this model after remapping.\n"
+        << "      --model-dir DIR    Empirical model directory. Default: models\n"
+        << "  -S, --species-model NAME\n"
+        << "                         Empirical preset selector. Default: auto\n"
+        << "                         Installed default: auto/human/chm13 -> human_cell_40mb\n"
         << "  -f, --offset FILE      Optional matrix bin-to-contig mapping.\n"
         << "                         Format: contig start_bin end_bin\n"
         << "  Sparse matrix format:  bin1 bin2 value\n"
         << "  Dense matrix format:   headerless square numeric matrix\n\n"
-        << "Synthetic contact model:\n"
+        << "Trans contact control:\n"
         << "  -t, --trans-ratio X    Fraction of trans-chromosomal contact mass.\n"
-        << "                         Default: species-aware auto, human/auto uses 0.12\n"
-        << "  --synthetic-contacts N Number of sparse contacts in synthetic matrix. Default: auto\n"
-        << "  --cis-decay-alpha X    Cis distance-decay exponent. Default: 1.0\n"
-        << "  --min-cis-distance-bins N\n"
-        << "                         Minimum cis bin separation for synthetic contacts.\n"
-        << "                         Default: 0, preserving strong same-bin contacts.\n"
-        << "  --max-cis-distance-bins N\n"
-        << "                         Maximum cis separation sampled for synthetic contacts.\n"
-        << "                         Default: 200\n"
-        << "  -S, --species-model NAME\n"
-        << "                         Preset: auto, generic_plant, human, arabidopsis,\n"
-        << "                         rice, maize, wheat, barley. Default: auto\n"
-        << "  -A, --arrangement-model M\n"
-        << "                         auto, territory, rabl, rosette, nonrabl. Default: auto\n"
-        << "  -T, --trans-model M    auto, territory, random, telomere, centromere,\n"
-        << "                         compartment, hubs.\n"
-        << "                         Default: auto\n"
-        << "  --trans-hotspots N     Number of hub bins for --trans-model hubs. Default: 8\n"
-        << "  --collision-randomness X\n"
-        << "                         Mix between random collision and arrangement effects.\n"
-        << "                         Range: 0..1, default: 0.35\n\n"
+        << "                         If --matrix and an empirical model are both used, cis\n"
+        << "                         stays from --matrix and trans comes from the model.\n\n"
         << "Output:\n"
         << "  PREFIX_R1.fastq and PREFIX_R2.fastq, always 150 bp paired-end reads.\n";
 }
@@ -162,6 +276,12 @@ Config parse_args(int argc, char **argv) {
             cfg.reference_path = require_value(arg);
         } else if (arg == "--matrix" || arg == "-m") {
             cfg.matrix_path = require_value(arg);
+        } else if (arg == "--matrix-format") {
+            cfg.matrix_format = parse_matrix_format(require_value(arg));
+        } else if (arg == "--empirical-model" || arg == "--model") {
+            cfg.empirical_model = require_value(arg);
+        } else if (arg == "--model-dir") {
+            cfg.model_dir = require_value(arg);
         } else if (arg == "--output-prefix" || arg == "-o") {
             cfg.output_prefix = require_value(arg);
         } else if (arg == "--offset" || arg == "-f") {
@@ -184,24 +304,8 @@ Config parse_args(int argc, char **argv) {
         } else if (arg == "--trans-ratio" || arg == "-t") {
             cfg.trans_ratio = std::stod(require_value(arg));
             cfg.trans_ratio_explicit = true;
-        } else if (arg == "--synthetic-contacts") {
-            cfg.synthetic_contact_count = std::stoull(require_value(arg));
-        } else if (arg == "--cis-decay-alpha") {
-            cfg.cis_decay_alpha = std::stod(require_value(arg));
-        } else if (arg == "--min-cis-distance-bins") {
-            cfg.min_cis_distance_bins = std::stoull(require_value(arg));
-        } else if (arg == "--max-cis-distance-bins") {
-            cfg.max_cis_distance_bins = std::stoull(require_value(arg));
         } else if (arg == "--species-model" || arg == "-S") {
             cfg.species_model = require_value(arg);
-        } else if (arg == "--arrangement-model" || arg == "-A") {
-            cfg.arrangement_model = require_value(arg);
-        } else if (arg == "--trans-model" || arg == "-T") {
-            cfg.trans_model = require_value(arg);
-        } else if (arg == "--trans-hotspots") {
-            cfg.trans_hotspots = std::stoull(require_value(arg));
-        } else if (arg == "--collision-randomness") {
-            cfg.collision_randomness = std::stod(require_value(arg));
         } else if (arg == "--help" || arg == "-h") {
             print_usage();
             std::exit(0);
@@ -256,15 +360,6 @@ Config parse_args(int argc, char **argv) {
     if (cfg.trans_ratio < 0.0 || cfg.trans_ratio > 1.0) {
         throw std::runtime_error("--trans-ratio must be within [0, 1].");
     }
-    if (cfg.cis_decay_alpha <= 0.0) {
-        throw std::runtime_error("--cis-decay-alpha must be positive.");
-    }
-    if (cfg.min_cis_distance_bins > cfg.max_cis_distance_bins) {
-        throw std::runtime_error("--min-cis-distance-bins cannot exceed --max-cis-distance-bins.");
-    }
-    if (cfg.collision_randomness < 0.0 || cfg.collision_randomness > 1.0) {
-        throw std::runtime_error("--collision-randomness must be within [0, 1].");
-    }
 
     return cfg;
 }
@@ -301,22 +396,23 @@ int main(int argc, char **argv) {
         }
 
         ContactMatrix matrix;
-        SyntheticModelOptions model_options;
-        model_options.trans_ratio = cfg.trans_ratio;
-        model_options.trans_ratio_explicit = cfg.trans_ratio_explicit;
-        model_options.cis_decay_alpha = cfg.cis_decay_alpha;
-        model_options.min_cis_distance_bins = cfg.min_cis_distance_bins;
-        model_options.max_cis_distance_bins = cfg.max_cis_distance_bins;
-        model_options.species_model = cfg.species_model;
-        model_options.arrangement_model = cfg.arrangement_model;
-        model_options.trans_model = cfg.trans_model;
-        model_options.trans_hotspots = cfg.trans_hotspots;
-        model_options.collision_randomness = cfg.collision_randomness;
-        model_options.seed = cfg.seed;
+        ContactMatrix empirical_matrix;
+        const std::string selected_model = infer_empirical_model(cfg);
+        const EmpiricalModelSpec empirical_spec =
+            load_empirical_model_spec(selected_model, cfg.model_dir);
+        std::cerr << "Loading empirical matrix model: " << empirical_spec.name << '\n'
+                  << "  matrix: " << empirical_spec.matrix_path << '\n'
+                  << "  offset: " << empirical_spec.offset_path << '\n';
+        const ContactMatrix empirical_source =
+            load_matrix(empirical_spec.matrix_path, 0, empirical_spec.matrix_format);
+        const std::vector<OffsetEntry> empirical_offsets =
+            load_offsets(empirical_spec.offset_path);
+        empirical_matrix =
+            remap_matrix_to_reference(empirical_source, empirical_offsets, reference_offsets);
 
         if (!cfg.matrix_path.empty()) {
             std::cerr << "Loading and remapping input matrix: " << cfg.matrix_path << '\n';
-            const ContactMatrix source_matrix = load_matrix(cfg.matrix_path, 0);
+            const ContactMatrix source_matrix = load_matrix(cfg.matrix_path, 0, cfg.matrix_format);
             const ContactMatrix remapped_matrix =
                 remap_matrix_to_reference(source_matrix, source_offsets, reference_offsets);
             const double empirical_fraction = source_offsets.empty()
@@ -324,31 +420,23 @@ int main(int argc, char **argv) {
                                                   : std::max(0.15, estimate_empirical_fraction(source_offsets, reference_offsets));
 
             if (empirical_fraction < 0.999) {
-                std::size_t synthetic_contacts = cfg.synthetic_contact_count;
-                if (synthetic_contacts == 0) {
-                    synthetic_contacts = std::max<std::size_t>(
-                        20000, std::min<std::size_t>(2000000, source_matrix.contacts.size() * 8 + total_bins * 10));
-                }
-                const ContactMatrix synthetic_fill =
-                    generate_synthetic_matrix(total_bins, reference_offsets, synthetic_contacts, model_options);
-                matrix = blend_contact_matrices(remapped_matrix, synthetic_fill, empirical_fraction);
+                matrix = blend_contact_matrices(remapped_matrix, empirical_matrix, empirical_fraction);
             } else {
                 matrix = remapped_matrix;
             }
 
-            matrix = apply_trans_ratio(matrix, reference_offsets, cfg.trans_ratio, cfg.seed);
+            std::cerr << "Replacing input trans contacts with empirical model trans contacts...\n";
+            matrix = replace_trans_contacts(matrix,
+                                            empirical_matrix,
+                                            reference_offsets,
+                                            cfg.trans_ratio,
+                                            cfg.trans_ratio_explicit);
         } else {
-            std::size_t synthetic_contacts = cfg.synthetic_contact_count;
-            if (synthetic_contacts == 0) {
-                synthetic_contacts = std::max<std::size_t>(
-                    20000, std::min<std::size_t>(2000000, total_bins * 10));
+            std::cerr << "Using empirical model as the full contact matrix.\n";
+            matrix = empirical_matrix;
+            if (cfg.trans_ratio_explicit) {
+                matrix = apply_trans_ratio(matrix, reference_offsets, cfg.trans_ratio);
             }
-            std::cerr << "Generating synthetic contact matrix with "
-                      << synthetic_contacts << " sampled contacts...\n";
-            matrix = generate_synthetic_matrix(total_bins,
-                                              reference_offsets,
-                                              synthetic_contacts,
-                                              model_options);
         }
         std::cerr << "Contact matrix ready: " << matrix.contacts.size() << " sparse contacts\n";
         const ContactMatrixStats matrix_stats = summarize_matrix(matrix, reference_offsets);

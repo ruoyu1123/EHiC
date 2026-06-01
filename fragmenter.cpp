@@ -15,6 +15,13 @@
 
 namespace {
 
+std::string normalize_site(std::string site) {
+    for (char &ch : site) {
+        ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+    }
+    return site;
+}
+
 struct RestrictionFragment {
     std::size_t id = 0;
     std::size_t contig_index = 0;
@@ -23,20 +30,22 @@ struct RestrictionFragment {
 };
 
 std::size_t infer_cut_offset(const std::string &site) {
-    if (site == "AAGCTT") {
+    const std::string normalized = normalize_site(site);
+    if (normalized == "AAGCTT") {
         return 1;  // HindIII: A|AGCTT
     }
-    if (site == "GATC") {
+    if (normalized == "GATC") {
         return 0;  // DpnII/MboI: ^GATC
     }
-    return site.size() / 2;
+    return normalized.size() / 2;
 }
 
 std::string build_ligation_junction(const std::string &site, std::size_t cut_offset) {
-    if (site.empty() || cut_offset > site.size()) {
+    const std::string normalized = normalize_site(site);
+    if (normalized.empty() || cut_offset > normalized.size()) {
         throw std::runtime_error("Invalid enzyme site or cut offset.");
     }
-    return site.substr(0, site.size() - cut_offset) + site.substr(cut_offset);
+    return normalized.substr(0, normalized.size() - cut_offset) + normalized.substr(cut_offset);
 }
 
 char complement(char base) {
@@ -118,10 +127,11 @@ std::vector<RestrictionFragment> digest_contig(const Contig &contig,
     }
 
     std::vector<RestrictionFragment> fragments;
+    const std::string normalized_site = normalize_site(site);
     std::size_t start = 0;
     std::size_t pos = 0;
     while (true) {
-        pos = contig.sequence.find(site, pos);
+        pos = contig.sequence.find(normalized_site, pos);
         if (pos == std::string::npos) {
             break;
         }
@@ -322,25 +332,6 @@ ReadPairTemplate sample_one_read_template(const Config &cfg,
     return make_read_template(name, left_ends, ligation_junction, right_ends, cfg.read_length);
 }
 
-template <typename EmitReadPair>
-void sample_hic_read_templates(const Config &cfg,
-                               const ReferenceGenome &reference,
-                               const std::vector<OffsetEntry> &offsets,
-                               const ContactMatrix &matrix,
-                               EmitReadPair emit) {
-    const auto index = build_fragment_sampling_index(cfg, reference, offsets, matrix.bin_count);
-    const std::size_t cut_offset = infer_cut_offset(cfg.enzyme_site);
-    const std::string ligation_junction = build_ligation_junction(cfg.enzyme_site, cut_offset);
-    const std::vector<double> weights = build_contact_sampling_weights(matrix, index.bin_to_fragments);
-    const CumulativeWeights contact_weights = build_cumulative_weights(weights);
-
-    std::mt19937_64 rng(cfg.seed + 1);
-
-    for (std::size_t i = 0; i < cfg.pair_count; ++i) {
-        emit(sample_one_read_template(cfg, reference, index, matrix, ligation_junction, contact_weights, rng, i));
-    }
-}
-
 }  // namespace
 
 void write_hic_reads(const Config &cfg,
@@ -353,18 +344,31 @@ void write_hic_reads(const Config &cfg,
     const std::string ligation_junction = build_ligation_junction(cfg.enzyme_site, cut_offset);
     const std::vector<double> weights = build_contact_sampling_weights(matrix, index.bin_to_fragments);
     const CumulativeWeights contact_weights = build_cumulative_weights(weights);
+    constexpr std::size_t pairs_per_block = 8192;
+
+    const auto make_pair_with_seed = [&](std::size_t pair_index, std::mt19937_64 &rng) {
+        return sample_one_read_template(cfg, reference, index, matrix, ligation_junction, contact_weights, rng, pair_index);
+    };
 
     const std::size_t worker_count = std::max<std::size_t>(1, cfg.thread_count);
     if (worker_count == 1 || cfg.pair_count < 20000) {
-        std::mt19937_64 rng(cfg.seed + 1);
-        for (std::size_t i = 0; i < cfg.pair_count; ++i) {
-            writer.write_template(
-                sample_one_read_template(cfg, reference, index, matrix, ligation_junction, contact_weights, rng, i));
+        for (std::size_t block_index = 0; block_index * pairs_per_block < cfg.pair_count; ++block_index) {
+            std::mt19937_64 rng(cfg.seed + 104729ULL * (block_index + 1));
+            const std::size_t begin_pair = block_index * pairs_per_block;
+            const std::size_t end_pair = std::min(cfg.pair_count, begin_pair + pairs_per_block);
+            FastqBlock block;
+            block.pair_count = end_pair - begin_pair;
+            block.read1.reserve(block.pair_count * 360);
+            block.read2.reserve(block.pair_count * 360);
+            for (std::size_t i = begin_pair; i < end_pair; ++i) {
+                ReadPairTemplate read_pair = make_pair_with_seed(i, rng);
+                append_simulated_fastq_pair(cfg, read_pair, rng, block.read1, block.read2);
+            }
+            writer.write_block(block);
         }
         return;
     }
 
-    constexpr std::size_t pairs_per_block = 8192;
     const std::size_t total_blocks = (cfg.pair_count + pairs_per_block - 1) / pairs_per_block;
     const std::size_t max_ready_blocks = worker_count * 2 + 2;
     std::atomic<std::size_t> next_block{0};
@@ -386,8 +390,7 @@ void write_hic_reads(const Config &cfg,
 
         std::mt19937_64 rng(cfg.seed + 104729ULL * (block_index + 1));
         for (std::size_t pair_index = begin_pair; pair_index < end_pair; ++pair_index) {
-            ReadPairTemplate read_pair =
-                sample_one_read_template(cfg, reference, index, matrix, ligation_junction, contact_weights, rng, pair_index);
+            ReadPairTemplate read_pair = make_pair_with_seed(pair_index, rng);
             append_simulated_fastq_pair(cfg, read_pair, rng, block.read1, block.read2);
         }
         return block;

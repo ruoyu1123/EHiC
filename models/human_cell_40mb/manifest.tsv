@@ -1,0 +1,5 @@
+name	human_cell_40mb
+matrix	matrix.tsv
+offset	offset.tsv
+format	dense
+description	Starter human-cell empirical matrix model at 40 Mb bins.
