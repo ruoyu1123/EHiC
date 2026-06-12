@@ -139,38 +139,6 @@ std::string infer_empirical_model(const Config &cfg) {
                              ". Provide --empirical-model or add models/<species>/manifest.tsv.");
 }
 
-double estimate_empirical_fraction(const std::vector<OffsetEntry> &source_offsets,
-                                   const std::vector<OffsetEntry> &target_offsets) {
-    if (target_offsets.empty()) {
-        return 0.0;
-    }
-    if (source_offsets.empty()) {
-        return 1.0;
-    }
-
-    std::unordered_map<std::string, std::size_t> target_bins_by_name;
-    std::size_t total_target_bins = 0;
-    for (const auto &offset : target_offsets) {
-        const std::size_t span = offset.end_bin > offset.start_bin ? offset.end_bin - offset.start_bin : 0;
-        target_bins_by_name[offset.contig] = span;
-        total_target_bins += span;
-    }
-    if (total_target_bins == 0) {
-        return 0.0;
-    }
-
-    std::size_t matched_bins = 0;
-    for (const auto &offset : source_offsets) {
-        const auto it = target_bins_by_name.find(offset.contig);
-        if (it != target_bins_by_name.end()) {
-            matched_bins += it->second;
-        }
-    }
-
-    const double fraction = static_cast<double>(matched_bins) / static_cast<double>(total_target_bins);
-    return std::max(0.0, std::min(1.0, fraction));
-}
-
 struct ContactMatrixStats {
     std::size_t cis_contacts = 0;
     std::size_t trans_contacts = 0;
@@ -253,8 +221,8 @@ void print_usage() {
         << "  Dense matrix format:   headerless square numeric matrix\n\n"
         << "Trans contact control:\n"
         << "  -t, --trans-ratio X    Fraction of trans-chromosomal contact mass.\n"
-        << "                         If --matrix and an empirical model are both used, cis\n"
-        << "                         stays from --matrix and trans comes from the model.\n\n"
+        << "                         Applied when an empirical model is used for the full\n"
+        << "                         matrix or for trans replacement.\n\n"
         << "Output:\n"
         << "  PREFIX_R1.fastq and PREFIX_R2.fastq, always 150 bp paired-end reads.\n";
 }
@@ -396,44 +364,47 @@ int main(int argc, char **argv) {
         }
 
         ContactMatrix matrix;
-        ContactMatrix empirical_matrix;
-        const std::string selected_model = infer_empirical_model(cfg);
-        const EmpiricalModelSpec empirical_spec =
-            load_empirical_model_spec(selected_model, cfg.model_dir);
-        std::cerr << "Loading empirical matrix model: " << empirical_spec.name << '\n'
-                  << "  matrix: " << empirical_spec.matrix_path << '\n'
-                  << "  offset: " << empirical_spec.offset_path << '\n';
-        const ContactMatrix empirical_source =
-            load_matrix(empirical_spec.matrix_path, 0, empirical_spec.matrix_format);
-        const std::vector<OffsetEntry> empirical_offsets =
-            load_offsets(empirical_spec.offset_path);
-        empirical_matrix =
-            remap_matrix_to_reference(empirical_source, empirical_offsets, reference_offsets);
-
         if (!cfg.matrix_path.empty()) {
             std::cerr << "Loading and remapping input matrix: " << cfg.matrix_path << '\n';
             const ContactMatrix source_matrix = load_matrix(cfg.matrix_path, 0, cfg.matrix_format);
-            const ContactMatrix remapped_matrix =
-                remap_matrix_to_reference(source_matrix, source_offsets, reference_offsets);
-            const double empirical_fraction = source_offsets.empty()
-                                                  ? 1.0
-                                                  : std::max(0.15, estimate_empirical_fraction(source_offsets, reference_offsets));
+            matrix = remap_matrix_to_reference(source_matrix, source_offsets, reference_offsets);
 
-            if (empirical_fraction < 0.999) {
-                matrix = blend_contact_matrices(remapped_matrix, empirical_matrix, empirical_fraction);
-            } else {
-                matrix = remapped_matrix;
+            if (!cfg.empirical_model.empty()) {
+                const EmpiricalModelSpec empirical_spec =
+                    load_empirical_model_spec(cfg.empirical_model, cfg.model_dir);
+                std::cerr << "Loading trans replacement model: " << empirical_spec.name << '\n'
+                          << "  matrix: " << empirical_spec.matrix_path << '\n'
+                          << "  offset: " << empirical_spec.offset_path << '\n';
+                const ContactMatrix empirical_source =
+                    load_matrix(empirical_spec.matrix_path, 0, empirical_spec.matrix_format);
+                const std::vector<OffsetEntry> empirical_offsets =
+                    load_offsets(empirical_spec.offset_path);
+                const ContactMatrix empirical_matrix =
+                    remap_matrix_to_reference(empirical_source, empirical_offsets, reference_offsets);
+
+                std::cerr << "Replacing input trans contacts with empirical model trans contacts...\n";
+                matrix = replace_trans_contacts(matrix,
+                                                empirical_matrix,
+                                                reference_offsets,
+                                                cfg.trans_ratio,
+                                                cfg.trans_ratio_explicit);
+            } else if (cfg.trans_ratio_explicit) {
+                std::cerr << "Ignoring --trans-ratio because no trans replacement model was provided.\n";
             }
-
-            std::cerr << "Replacing input trans contacts with empirical model trans contacts...\n";
-            matrix = replace_trans_contacts(matrix,
-                                            empirical_matrix,
-                                            reference_offsets,
-                                            cfg.trans_ratio,
-                                            cfg.trans_ratio_explicit);
         } else {
+            const std::string selected_model = infer_empirical_model(cfg);
+            const EmpiricalModelSpec empirical_spec =
+                load_empirical_model_spec(selected_model, cfg.model_dir);
+            std::cerr << "Loading empirical matrix model: " << empirical_spec.name << '\n'
+                      << "  matrix: " << empirical_spec.matrix_path << '\n'
+                      << "  offset: " << empirical_spec.offset_path << '\n';
+            const ContactMatrix empirical_source =
+                load_matrix(empirical_spec.matrix_path, 0, empirical_spec.matrix_format);
+            const std::vector<OffsetEntry> empirical_offsets =
+                load_offsets(empirical_spec.offset_path);
+            matrix =
+                remap_matrix_to_reference(empirical_source, empirical_offsets, reference_offsets);
             std::cerr << "Using empirical model as the full contact matrix.\n";
-            matrix = empirical_matrix;
             if (cfg.trans_ratio_explicit) {
                 matrix = apply_trans_ratio(matrix, reference_offsets, cfg.trans_ratio);
             }

@@ -60,7 +60,7 @@ Optional arguments:
 
 - `-m`, `--matrix`: input Hi-C matrix. If omitted, `hicreate` uses the empirical model linked to `--species-model`
 - `--matrix-format`: matrix parser mode (`auto`, `sparse`, `dense`, `binary`), default `auto`
-- `--empirical-model`, `--model`: empirical matrix model name or manifest path. Without `--matrix`, use the model as the full matrix. With `--matrix`, preserve input cis contacts and replace input trans contacts with the model's remapped, normalized trans contacts
+- `--empirical-model`, `--model`: empirical matrix model name or manifest path. Without `--matrix`, use the model as the full matrix. With `--matrix`, preserve input cis contacts and replace input trans contacts with the model's remapped trans contacts. If omitted, the input matrix is used as-is.
 - `--model-dir`: empirical model directory, default `models`
 - `-S`, `--species-model`: empirical preset selector. Default `auto`; currently `auto`, `human`, `homo_sapiens`, `mammal`, and `chm13` resolve to `human_cell_40mb` unless `--empirical-model` is provided
 - `-f`, `--offset`: contig-to-global-bin mapping file
@@ -70,7 +70,7 @@ Optional arguments:
 - `-e`, `--enzyme-site`: restriction enzyme motif, default `AAGCTT`
 - `-s`, `--seed`: random seed
 - `-j`, `--threads`: worker threads for read generation, default `1`; use `0` to auto-detect hardware threads
-- `-t`, `--trans-ratio`: target fraction of trans-chromosomal interaction mass. This rescales existing empirical trans contacts; it no longer fabricates missing trans contacts
+- `-t`, `--trans-ratio`: target fraction of trans-chromosomal interaction mass. This rescales existing empirical trans contacts when an empirical model is in use
 
 ## Input Files
 
@@ -168,7 +168,8 @@ If `--coverage` is provided, it replaces `--pairs` and computes the FASTQ record
 - The simulation is driven by the input Hi-C matrix contact frequencies or by an empirical model selected with `--empirical-model`/`--species-model`.
 - If `--matrix` is provided, input cis contacts are preserved and trans contacts are replaced by the selected empirical model.
 - If both `--matrix` and an empirical model are provided, the input matrix provides cis contacts and the empirical model provides trans contacts.
-- If `--matrix` and `--offset` do not perfectly match the target reference, contacts are remapped onto the target contigs by name and relative position, then missing signal is filled from the selected empirical model.
+- If `--matrix` is provided without `--empirical-model`, the input matrix is used as-is after remapping to the target reference.
+- If `--matrix` and `--offset` do not perfectly match the target reference, contacts are remapped onto the target contigs by name and relative position.
 - If `--matrix` is provided without `--offset`, the matrix is resized globally to the target genome bin count.
 - If `--matrix` is omitted, the selected empirical model is remapped to the target reference and used as the full contact matrix.
 - Restriction digestion is modeled explicitly from the reference sequence.
