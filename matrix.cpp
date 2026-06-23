@@ -95,9 +95,17 @@ bool is_offset_header(const std::vector<std::string> &tokens) {
     if (tokens.size() < 3) {
         return false;
     }
-    return token_lower(tokens[0]) == "contig" &&
-           token_lower(tokens[1]) == "start_bin" &&
-           token_lower(tokens[2]) == "end_bin";
+    const std::string first = token_lower(tokens[0]);
+    const std::string second = token_lower(tokens[1]);
+    const std::string third = token_lower(tokens[2]);
+    if (first == "contig" && second == "start_bin" && third == "end_bin") {
+        return true;
+    }
+    return tokens.size() >= 4 &&
+           (first == "name" || first == "contig") &&
+           second == "bin_offset" &&
+           third == "length" &&
+           token_lower(tokens[3]) == "bin_num";
 }
 
 bool has_binary_matrix_suffix(const std::string &path) {
@@ -455,7 +463,8 @@ std::vector<OffsetEntry> load_offsets(const std::string &path) {
 
         const auto tokens = split_tokens(line);
         if (tokens.size() < 3) {
-            throw std::runtime_error("Offset rows must contain: contig start_bin end_bin");
+            throw std::runtime_error("Offset rows must contain either: contig start_bin end_bin "
+                                     "or name bin_offset length bin_num");
         }
         if (is_offset_header(tokens)) {
             continue;
@@ -464,7 +473,15 @@ std::vector<OffsetEntry> load_offsets(const std::string &path) {
         OffsetEntry entry;
         entry.contig = tokens[0];
         entry.start_bin = std::stoull(tokens[1]);
-        entry.end_bin = std::stoull(tokens[2]);
+        if (tokens.size() >= 4) {
+            const std::size_t bin_num = std::stoull(tokens[3]);
+            if (bin_num > std::numeric_limits<std::size_t>::max() - entry.start_bin) {
+                throw std::runtime_error("Offset bin_offset + bin_num overflows size_t.");
+            }
+            entry.end_bin = entry.start_bin + bin_num;
+        } else {
+            entry.end_bin = std::stoull(tokens[2]);
+        }
         if (entry.end_bin <= entry.start_bin) {
             throw std::runtime_error("Offset end_bin must be greater than start_bin.");
         }

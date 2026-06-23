@@ -111,7 +111,17 @@ chr2    2000        3500
 - `start_bin` is inclusive
 - `end_bin` is exclusive
 - This lets one global sparse matrix describe multiple contigs or chromosomes
+- hicmap-style offsets are also accepted directly:
 
+```text
+name    bin_offset  length      bin_num
+chr1    0           40000000    2000
+chr2    2000        30000000    1500
+```
+
+- For hicmap-style offsets, `start_bin = bin_offset` and `end_bin = bin_offset + bin_num`
+- The `length` column is accepted for compatibility and is not used for bin interval calculation
+	
 
 Empirical model directory:
 
