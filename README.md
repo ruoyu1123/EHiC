@@ -169,13 +169,17 @@ If `--coverage` is provided, it replaces `--pairs` and computes the FASTQ record
 - If `--matrix` is provided, input cis contacts are preserved and trans contacts are replaced by the selected empirical model.
 - If both `--matrix` and an empirical model are provided, the input matrix provides cis contacts and the empirical model provides trans contacts.
 - If `--matrix` is provided without `--empirical-model`, the input matrix is used as-is after remapping to the target reference.
+- If `--matrix` and `--offset` exactly match the target reference contig names and bin ranges, the matrix is used directly and resize/remap is skipped.
 - If `--matrix` and `--offset` do not perfectly match the target reference, contacts are remapped onto the target contigs by name and relative position.
+- If the target reference contains contigs that are missing from the matrix offset file, `hicreate` assigns each missing target contig a random source contig template, remaps contacts through that template, and reports a warning.
+- When a source contig and target contig have different bin spans, remapping is done per contig for cis and per contig-pair for trans, and each source-bin contact is distributed across neighboring target bins instead of collapsing the full weight into a single target bin.
 - If `--matrix` is provided without `--offset`, the matrix is resized globally to the target genome bin count.
-- If `--matrix` is omitted, the selected empirical model is remapped to the target reference and used as the full contact matrix.
+- If `--matrix` is omitted, the selected empirical model goes through the same offset check: exact offset matches are used directly, and only mismatched offsets are remapped to the target reference.
 - Restriction digestion is modeled explicitly from the reference sequence.
 - Common enzyme cut offsets are recognized for motifs such as HindIII and DpnII/MboI.
 - Ligation products include an explicit fill-in ligation junction, but the program does not materialize full ligation molecules per read pair.
 - For each sampled ligation event, reads are sliced from the ligated restriction-fragment ends outward. Short fragments are extended across the virtual ligation junction mathematically, without materializing long ligated sequences.
+- Read start positions are sampled at random offsets within the virtual ligation templates, so repeated sampling from the same ligation event can yield different read windows.
 - Each run reports the matrix cis/trans contact counts and weight fractions before FASTQ generation, which helps diagnose whether an unexpected map comes from the contact model or from downstream alignment/filtering.
 - Read pairs are generated in bounded FASTQ blocks and streamed to disk, so memory does not scale with `--pairs` or `--coverage`.
 - `--threads` parallelizes read-pair sampling, template construction, quality simulation, and FASTQ block formatting; a single writer preserves ordered output and avoids file-write lock contention.

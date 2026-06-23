@@ -88,14 +88,6 @@ std::string reference_slice(const ReferenceGenome &reference,
     return sequence.substr(start, end - start);
 }
 
-void append_prefix(std::string &out, const std::string &sequence, std::size_t target_length) {
-    if (out.size() >= target_length) {
-        return;
-    }
-    const std::size_t remaining = target_length - out.size();
-    out.append(sequence, 0, std::min(remaining, sequence.size()));
-}
-
 struct FragmentEndTemplate {
     std::string outward;
 };
@@ -103,9 +95,9 @@ struct FragmentEndTemplate {
 FragmentEndTemplate get_fragment_end_template(const ReferenceGenome &reference,
                                               const RestrictionFragment &fragment,
                                               bool use_right_end,
-                                              std::size_t read_length) {
+                                              std::size_t template_length) {
     const std::size_t fragment_length = fragment.end - fragment.start;
-    const std::size_t take = std::min(fragment_length, read_length);
+    const std::size_t take = std::min(fragment_length, template_length);
     if (!use_right_end) {
         return FragmentEndTemplate{
             reference_slice(reference, fragment, fragment.start, fragment.start + take)
@@ -276,18 +268,17 @@ ReadPairTemplate make_read_template(const std::string &name,
                                     const FragmentEndTemplate &left,
                                     const std::string &ligation_junction,
                                     const FragmentEndTemplate &right,
-                                    std::size_t read_length) {
-    std::string read1_template;
-    read1_template.reserve(read_length);
-    append_prefix(read1_template, left.outward, read_length);
-    append_prefix(read1_template, ligation_junction, read_length);
-    append_prefix(read1_template, right.outward, read_length);
+                                    std::size_t read_length,
+                                    std::mt19937_64 &rng) {
+    const std::string read1_scaffold = left.outward + ligation_junction + right.outward;
+    const std::string read2_scaffold = right.outward + ligation_junction + left.outward;
+    const std::size_t scaffold_length = read1_scaffold.size();
+    const std::size_t max_offset = scaffold_length > read_length ? scaffold_length - read_length : 0;
+    const std::size_t start_offset =
+        max_offset > 0 ? std::uniform_int_distribution<std::size_t>(0, max_offset)(rng) : 0;
 
-    std::string read2_template;
-    read2_template.reserve(read_length);
-    append_prefix(read2_template, right.outward, read_length);
-    append_prefix(read2_template, ligation_junction, read_length);
-    append_prefix(read2_template, left.outward, read_length);
+    std::string read1_template = read1_scaffold.substr(start_offset, read_length);
+    std::string read2_template = read2_scaffold.substr(start_offset, read_length);
 
     return ReadPairTemplate{
         name,
@@ -321,15 +312,16 @@ ReadPairTemplate sample_one_read_template(const Config &cfg,
 
     const bool use_left_right_end = std::uniform_int_distribution<int>(0, 1)(rng) == 1;
     const bool use_right_right_end = std::uniform_int_distribution<int>(0, 1)(rng) == 1;
+    const std::size_t template_length = cfg.read_length * 2;
     const FragmentEndTemplate left_ends =
-        get_fragment_end_template(reference, left, use_left_right_end, cfg.read_length);
+        get_fragment_end_template(reference, left, use_left_right_end, template_length);
     const FragmentEndTemplate right_ends =
-        get_fragment_end_template(reference, right, use_right_right_end, cfg.read_length);
+        get_fragment_end_template(reference, right, use_right_right_end, template_length);
 
     const std::string name = "hicreate_" + std::to_string(pair_index + 1) +
                              "_bin" + std::to_string(contact.bin1) +
                              "_bin" + std::to_string(contact.bin2);
-    return make_read_template(name, left_ends, ligation_junction, right_ends, cfg.read_length);
+    return make_read_template(name, left_ends, ligation_junction, right_ends, cfg.read_length, rng);
 }
 
 }  // namespace

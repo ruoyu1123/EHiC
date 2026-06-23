@@ -33,9 +33,14 @@ std::vector<OffsetEntry> load_offsets(const std::string &path);
 ContactMatrix load_matrix(const std::string &path,
                           std::size_t expected_bin_count,
                           MatrixFormat format = MatrixFormat::Auto);
+bool offsets_match_reference_exactly(const std::vector<OffsetEntry> &source_offsets,
+                                     const std::vector<OffsetEntry> &target_offsets,
+                                     std::string *reason = nullptr);
 ContactMatrix remap_matrix_to_reference(const ContactMatrix &source_matrix,
                                         const std::vector<OffsetEntry> &source_offsets,
-                                        const std::vector<OffsetEntry> &target_offsets);
+                                        const std::vector<OffsetEntry> &target_offsets,
+                                        std::uint64_t seed = 0,
+                                        std::vector<std::string> *warnings = nullptr);
 ContactMatrix apply_trans_ratio(const ContactMatrix &matrix,
                                 const std::vector<OffsetEntry> &offsets,
                                 double target_trans_ratio);

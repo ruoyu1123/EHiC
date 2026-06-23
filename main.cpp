@@ -42,6 +42,20 @@ MatrixFormat parse_matrix_format(const std::string &value) {
     throw std::runtime_error("--matrix-format must be one of: auto, sparse, dense, binary.");
 }
 
+std::string matrix_format_to_string(MatrixFormat format) {
+    switch (format) {
+        case MatrixFormat::Auto:
+            return "auto";
+        case MatrixFormat::Sparse:
+            return "sparse";
+        case MatrixFormat::Dense:
+            return "dense";
+        case MatrixFormat::BinarySparse:
+            return "binary";
+    }
+    return "unknown";
+}
+
 struct EmpiricalModelSpec {
     std::string name;
     std::string matrix_path;
@@ -173,6 +187,66 @@ ContactMatrixStats summarize_matrix(const ContactMatrix &matrix,
         }
     }
     return stats;
+}
+
+ContactMatrix align_matrix_to_reference(const ContactMatrix &source_matrix,
+                                        const std::vector<OffsetEntry> &source_offsets,
+                                        const std::vector<OffsetEntry> &reference_offsets,
+                                        std::uint64_t seed,
+                                        const std::string &label) {
+    const std::size_t reference_bin_count =
+        reference_offsets.empty() ? 0 : reference_offsets.back().end_bin;
+    std::cerr << "Preparing " << label
+              << ": source bins=" << source_matrix.bin_count
+              << ", source offsets=" << source_offsets.size()
+              << ", target offsets=" << reference_offsets.size()
+              << ", target bins=" << reference_bin_count << '\n';
+
+    if (source_offsets.empty()) {
+        std::cerr << "No offset provided for " << label
+                  << "; falling back to global bin scaling.\n";
+        std::vector<std::string> remap_warnings;
+        ContactMatrix remapped = remap_matrix_to_reference(source_matrix,
+                                                           source_offsets,
+                                                           reference_offsets,
+                                                           seed,
+                                                           &remap_warnings);
+        for (const auto &warning : remap_warnings) {
+            std::cerr << "Warning: " << warning << '\n';
+        }
+        return remapped;
+    }
+
+    std::string offset_match_reason;
+    if (offsets_match_reference_exactly(source_offsets, reference_offsets, &offset_match_reason)) {
+        if (source_matrix.bin_count != reference_offsets.back().end_bin) {
+            std::cerr << "Using exact offset match for " << label
+                      << ", but matrix bin_count (" << source_matrix.bin_count
+                      << ") differs from target bin count (" << reference_offsets.back().end_bin
+                      << "); remapping to reconcile bin count.\n";
+        } else {
+            std::cerr << "Offset layout for " << label
+                      << " matches target reference exactly; skipping resize/remap.\n";
+            return source_matrix;
+        }
+    } else {
+        std::cerr << "Resizing/remapping " << label << " because "
+                  << offset_match_reason << ".\n";
+    }
+
+    std::vector<std::string> remap_warnings;
+    ContactMatrix remapped = remap_matrix_to_reference(source_matrix,
+                                                       source_offsets,
+                                                       reference_offsets,
+                                                       seed,
+                                                       &remap_warnings);
+    std::cerr << "Completed resize/remap for " << label
+              << ": output bins=" << remapped.bin_count
+              << ", sparse contacts=" << remapped.contacts.size() << '\n';
+    for (const auto &warning : remap_warnings) {
+        std::cerr << "Warning: " << warning << '\n';
+    }
+    return remapped;
 }
 
 void print_usage() {
@@ -356,6 +430,37 @@ int main(int argc, char **argv) {
             throw std::runtime_error("Reference produced zero bins.");
         }
         std::cerr << "Global bins: " << total_bins << '\n';
+        std::cerr << "Run configuration:\n"
+                  << "  output prefix: " << cfg.output_prefix << '\n'
+                  << "  bin size: " << cfg.bin_size << '\n'
+                  << "  read length: " << cfg.read_length << '\n'
+                  << "  enzyme site: " << cfg.enzyme_site << '\n'
+                  << "  threads: " << cfg.thread_count << '\n'
+                  << "  seed: " << cfg.seed << '\n'
+                  << "  matrix path: " << (cfg.matrix_path.empty() ? "<none>" : cfg.matrix_path) << '\n'
+                  << "  matrix format: " << matrix_format_to_string(cfg.matrix_format) << '\n'
+                  << "  offset path: " << (cfg.offset_path.empty() ? "<none>" : cfg.offset_path) << '\n'
+                  << "  empirical model: " << (cfg.empirical_model.empty() ? "<auto/none>" : cfg.empirical_model) << '\n'
+                  << "  species model: " << cfg.species_model << '\n'
+                  << "  model dir: " << cfg.model_dir << '\n'
+                  << "  trans ratio: ";
+        if (cfg.trans_ratio_explicit) {
+            std::cerr << cfg.trans_ratio << " (explicit)\n";
+        } else {
+            std::cerr << cfg.trans_ratio << " (default / used only when applicable)\n";
+        }
+        if (cfg.coverage_depth > 0.0) {
+            std::cerr << "  coverage: " << cfg.coverage_depth << "x\n"
+                      << "  read pairs: " << cfg.pair_count << " (derived from coverage)\n";
+        } else {
+            std::cerr << "  coverage: <none>\n"
+                      << "  read pairs: " << cfg.pair_count;
+            if (cfg.pair_count_explicit) {
+                std::cerr << " (explicit)\n";
+            } else {
+                std::cerr << " (default)\n";
+            }
+        }
 
         const std::vector<OffsetEntry> reference_offsets = build_reference_offsets(reference, cfg.bin_size);
         std::vector<OffsetEntry> source_offsets;
@@ -365,9 +470,13 @@ int main(int argc, char **argv) {
 
         ContactMatrix matrix;
         if (!cfg.matrix_path.empty()) {
-            std::cerr << "Loading and remapping input matrix: " << cfg.matrix_path << '\n';
+            std::cerr << "Loading input matrix: " << cfg.matrix_path << '\n';
             const ContactMatrix source_matrix = load_matrix(cfg.matrix_path, 0, cfg.matrix_format);
-            matrix = remap_matrix_to_reference(source_matrix, source_offsets, reference_offsets);
+            matrix = align_matrix_to_reference(source_matrix,
+                                              source_offsets,
+                                              reference_offsets,
+                                              cfg.seed,
+                                              "input matrix");
 
             if (!cfg.empirical_model.empty()) {
                 const EmpiricalModelSpec empirical_spec =
@@ -380,7 +489,11 @@ int main(int argc, char **argv) {
                 const std::vector<OffsetEntry> empirical_offsets =
                     load_offsets(empirical_spec.offset_path);
                 const ContactMatrix empirical_matrix =
-                    remap_matrix_to_reference(empirical_source, empirical_offsets, reference_offsets);
+                    align_matrix_to_reference(empirical_source,
+                                              empirical_offsets,
+                                              reference_offsets,
+                                              cfg.seed + 1,
+                                              "empirical trans model");
 
                 std::cerr << "Replacing input trans contacts with empirical model trans contacts...\n";
                 matrix = replace_trans_contacts(matrix,
@@ -402,8 +515,11 @@ int main(int argc, char **argv) {
                 load_matrix(empirical_spec.matrix_path, 0, empirical_spec.matrix_format);
             const std::vector<OffsetEntry> empirical_offsets =
                 load_offsets(empirical_spec.offset_path);
-            matrix =
-                remap_matrix_to_reference(empirical_source, empirical_offsets, reference_offsets);
+            matrix = align_matrix_to_reference(empirical_source,
+                                               empirical_offsets,
+                                               reference_offsets,
+                                               cfg.seed,
+                                               "empirical matrix model");
             std::cerr << "Using empirical model as the full contact matrix.\n";
             if (cfg.trans_ratio_explicit) {
                 matrix = apply_trans_ratio(matrix, reference_offsets, cfg.trans_ratio);
