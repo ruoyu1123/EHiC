@@ -22,5 +22,6 @@ struct Config {
     std::uint64_t seed = 1;
     double trans_ratio = 0.10;
     bool trans_ratio_explicit = false;
+    bool force_contig_reuse = false;
     std::string species_model = "auto";
 };

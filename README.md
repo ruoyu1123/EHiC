@@ -42,7 +42,7 @@ hicreate ref.fa 1000 \
          [--empirical-model human_cell_40mb] [--model-dir models] \
          [--coverage X | --pairs 100000] [--output-prefix sim] \
          [--offset offset.tsv] [--enzyme-site AAGCTT] [--seed 42] [--threads 4] \
-         [--trans-ratio 0.12] [--species-model auto]
+         [--trans-ratio 0.12] [--force-contig-reuse] [--species-model auto]
 ```
 
 Required arguments:
@@ -71,6 +71,7 @@ Optional arguments:
 - `-s`, `--seed`: random seed
 - `-j`, `--threads`: worker threads for read generation, default `1`; use `0` to auto-detect hardware threads
 - `-t`, `--trans-ratio`: target fraction of trans-chromosomal interaction mass. This rescales existing empirical trans contacts when an empirical model is in use
+- `--force-contig-reuse`: allow an offset with fewer source contigs than the reference. Reused-target trans blocks are synthesized from real source trans blocks and the final trans mass is normalized
 
 ## Input Files
 
@@ -180,8 +181,8 @@ If `--coverage` is provided, it replaces `--pairs` and computes the FASTQ record
 - If both `--matrix` and an empirical model are provided, the input matrix provides cis contacts and the empirical model provides trans contacts.
 - If `--matrix` is provided without `--empirical-model`, the input matrix is used as-is after remapping to the target reference.
 - If `--matrix` and `--offset` exactly match the target reference contig names and bin ranges, the matrix is used directly and resize/remap is skipped.
-- If `--matrix` and `--offset` do not perfectly match the target reference, contacts are remapped onto the target contigs by name and relative position.
-- If the target reference contains contigs that are missing from the matrix offset file, `hicreate` assigns each missing target contig a random source contig template, remaps contacts through that template, and reports a warning.
+- If `--matrix` and `--offset` do not perfectly match the target reference, same-name contigs are paired first; remaining contigs are paired one-to-one by offset order. Cis is scaled within each paired contig and trans is scaled between the corresponding paired contigs.
+- By default, a matrix offset must contain at least as many contigs as the target reference. With `--force-contig-reuse`, source contigs may be reused; cis remains inside each target copy, while contacts between copies use a real trans block between that source and another source contig. The resulting trans mass is normalized to the pre-synthesis total.
 - When a source contig and target contig have different bin spans, remapping is done per contig for cis and per contig-pair for trans, and each source-bin contact is distributed across neighboring target bins instead of collapsing the full weight into a single target bin.
 - If `--matrix` is provided without `--offset`, the matrix is resized globally to the target genome bin count.
 - If `--matrix` is omitted, the selected empirical model goes through the same offset check: exact offset matches are used directly, and only mismatched offsets are remapped to the target reference.

@@ -370,6 +370,7 @@ void write_hic_reads(const Config &cfg,
     std::condition_variable cv;
     std::map<std::size_t, FastqBlock> ready_blocks;
     std::exception_ptr worker_error;
+    std::size_t next_to_write = 0;
 
     const auto make_block = [&](std::size_t block_index) {
         const std::size_t begin_pair = block_index * pairs_per_block;
@@ -398,8 +399,11 @@ void write_hic_reads(const Config &cfg,
                 FastqBlock block = make_block(block_index);
                 {
                     std::unique_lock<std::mutex> lock(mutex);
+                    // The ordered writer must always be able to receive the block it awaits.
                     cv.wait(lock, [&]() {
-                        return stop_workers.load() || ready_blocks.size() < max_ready_blocks;
+                        return stop_workers.load() ||
+                               ready_blocks.size() < max_ready_blocks ||
+                               block_index == next_to_write;
                     });
                     if (stop_workers.load()) {
                         break;
@@ -429,7 +433,6 @@ void write_hic_reads(const Config &cfg,
         workers.emplace_back(worker);
     }
 
-    std::size_t next_to_write = 0;
     while (next_to_write < total_blocks) {
         FastqBlock block;
         {
@@ -449,7 +452,11 @@ void write_hic_reads(const Config &cfg,
         }
         cv.notify_all();
         writer.write_block(block);
-        ++next_to_write;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            ++next_to_write;
+        }
+        cv.notify_all();
     }
 
     stop_workers.store(true);

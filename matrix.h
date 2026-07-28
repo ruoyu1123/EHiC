@@ -40,7 +40,8 @@ ContactMatrix remap_matrix_to_reference(const ContactMatrix &source_matrix,
                                         const std::vector<OffsetEntry> &source_offsets,
                                         const std::vector<OffsetEntry> &target_offsets,
                                         std::uint64_t seed = 0,
-                                        std::vector<std::string> *warnings = nullptr);
+                                        std::vector<std::string> *warnings = nullptr,
+                                        bool force_contig_reuse = false);
 ContactMatrix apply_trans_ratio(const ContactMatrix &matrix,
                                 const std::vector<OffsetEntry> &offsets,
                                 double target_trans_ratio);

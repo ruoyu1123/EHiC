@@ -193,7 +193,8 @@ ContactMatrix align_matrix_to_reference(const ContactMatrix &source_matrix,
                                         const std::vector<OffsetEntry> &source_offsets,
                                         const std::vector<OffsetEntry> &reference_offsets,
                                         std::uint64_t seed,
-                                        const std::string &label) {
+                                        const std::string &label,
+                                        bool force_contig_reuse) {
     const std::size_t reference_bin_count =
         reference_offsets.empty() ? 0 : reference_offsets.back().end_bin;
     std::cerr << "Preparing " << label
@@ -210,11 +211,28 @@ ContactMatrix align_matrix_to_reference(const ContactMatrix &source_matrix,
                                                            source_offsets,
                                                            reference_offsets,
                                                            seed,
-                                                           &remap_warnings);
+                                                           &remap_warnings,
+                                                           false);
         for (const auto &warning : remap_warnings) {
             std::cerr << "Warning: " << warning << '\n';
         }
         return remapped;
+    }
+
+    if (source_offsets.size() < reference_offsets.size() && !force_contig_reuse) {
+        throw std::runtime_error(label + " offset has " +
+                                 std::to_string(source_offsets.size()) +
+                                 " contigs, but the target reference has " +
+                                 std::to_string(reference_offsets.size()) +
+                                 ". Refusing to reuse source contigs because trans contacts "
+                                 "between duplicated templates cannot be inferred. Provide an "
+                                 "offset with at least as many contigs as the target reference, "
+                                 "or explicitly enable --force-contig-reuse.");
+    }
+    if (source_offsets.size() < reference_offsets.size()) {
+        std::cerr << "Warning: forcing source contig reuse for " << label
+                  << "; duplicate-target trans blocks will be synthesized from real source "
+                     "trans contacts and normalized.\n";
     }
 
     std::string offset_match_reason;
@@ -239,7 +257,8 @@ ContactMatrix align_matrix_to_reference(const ContactMatrix &source_matrix,
                                                        source_offsets,
                                                        reference_offsets,
                                                        seed,
-                                                       &remap_warnings);
+                                                       &remap_warnings,
+                                                       force_contig_reuse);
     std::cerr << "Completed resize/remap for " << label
               << ": output bins=" << remapped.bin_count
               << ", sparse contacts=" << remapped.contacts.size() << '\n';
@@ -291,7 +310,11 @@ void print_usage() {
         << "                         Installed default: auto/human/chm13 -> human_cell_40mb\n"
         << "  -f, --offset FILE      Optional matrix bin-to-contig mapping.\n"
         << "                         Formats: contig start_bin end_bin, or\n"
-        << "                                  name bin_offset length bin_num\n"
+        << "                                  name bin_offset length bin_num. Source offsets\n"
+        << "                         must contain at least as many contigs as the reference.\n"
+        << "      --force-contig-reuse\n"
+        << "                         Allow fewer source contigs. Duplicate-target trans blocks\n"
+        << "                         are copied from real source trans blocks and normalized.\n"
         << "  Sparse matrix format:  bin1 bin2 value\n"
         << "  Dense matrix format:   headerless square numeric matrix\n\n"
         << "Trans contact control:\n"
@@ -347,6 +370,8 @@ Config parse_args(int argc, char **argv) {
         } else if (arg == "--trans-ratio" || arg == "-t") {
             cfg.trans_ratio = std::stod(require_value(arg));
             cfg.trans_ratio_explicit = true;
+        } else if (arg == "--force-contig-reuse") {
+            cfg.force_contig_reuse = true;
         } else if (arg == "--species-model" || arg == "-S") {
             cfg.species_model = require_value(arg);
         } else if (arg == "--help" || arg == "-h") {
@@ -444,6 +469,7 @@ int main(int argc, char **argv) {
                   << "  empirical model: " << (cfg.empirical_model.empty() ? "<auto/none>" : cfg.empirical_model) << '\n'
                   << "  species model: " << cfg.species_model << '\n'
                   << "  model dir: " << cfg.model_dir << '\n'
+                  << "  force contig reuse: " << (cfg.force_contig_reuse ? "yes" : "no") << '\n'
                   << "  trans ratio: ";
         if (cfg.trans_ratio_explicit) {
             std::cerr << cfg.trans_ratio << " (explicit)\n";
@@ -477,7 +503,8 @@ int main(int argc, char **argv) {
                                               source_offsets,
                                               reference_offsets,
                                               cfg.seed,
-                                              "input matrix");
+                                              "input matrix",
+                                              cfg.force_contig_reuse);
 
             if (!cfg.empirical_model.empty()) {
                 const EmpiricalModelSpec empirical_spec =
@@ -494,7 +521,8 @@ int main(int argc, char **argv) {
                                               empirical_offsets,
                                               reference_offsets,
                                               cfg.seed + 1,
-                                              "empirical trans model");
+                                              "empirical trans model",
+                                              cfg.force_contig_reuse);
 
                 std::cerr << "Replacing input trans contacts with empirical model trans contacts...\n";
                 matrix = replace_trans_contacts(matrix,
@@ -520,7 +548,8 @@ int main(int argc, char **argv) {
                                                empirical_offsets,
                                                reference_offsets,
                                                cfg.seed,
-                                               "empirical matrix model");
+                                               "empirical matrix model",
+                                               cfg.force_contig_reuse);
             std::cerr << "Using empirical model as the full contact matrix.\n";
             if (cfg.trans_ratio_explicit) {
                 matrix = apply_trans_ratio(matrix, reference_offsets, cfg.trans_ratio);

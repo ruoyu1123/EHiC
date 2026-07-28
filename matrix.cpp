@@ -12,6 +12,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace {
 
@@ -494,7 +495,15 @@ std::vector<OffsetEntry> load_offsets(const std::string &path) {
 
     std::sort(offsets.begin(), offsets.end(),
               [](const OffsetEntry &lhs, const OffsetEntry &rhs) { return lhs.start_bin < rhs.start_bin; });
-    for (std::size_t i = 1; i < offsets.size(); ++i) {
+    std::unordered_set<std::string> contig_names;
+    contig_names.reserve(offsets.size());
+    for (std::size_t i = 0; i < offsets.size(); ++i) {
+        if (!contig_names.insert(offsets[i].contig).second) {
+            throw std::runtime_error("Offset contig names must be unique: " + offsets[i].contig);
+        }
+        if (i == 0) {
+            continue;
+        }
         if (offsets[i].start_bin < offsets[i - 1].end_bin) {
             throw std::runtime_error("Offset intervals overlap.");
         }
@@ -653,7 +662,8 @@ ContactMatrix remap_matrix_to_reference(const ContactMatrix &source_matrix,
                                         const std::vector<OffsetEntry> &source_offsets,
                                         const std::vector<OffsetEntry> &target_offsets,
                                         std::uint64_t seed,
-                                        std::vector<std::string> *warnings) {
+                                        std::vector<std::string> *warnings,
+                                        bool force_contig_reuse) {
     const std::size_t target_bin_count = total_offset_bins(target_offsets);
     if (target_bin_count == 0) {
         throw std::runtime_error("Reference offsets are empty.");
@@ -670,34 +680,84 @@ ContactMatrix remap_matrix_to_reference(const ContactMatrix &source_matrix,
         source_index_by_name[source_offsets[i].contig] = i;
     }
 
-    std::vector<std::vector<std::size_t>> targets_by_source(source_offsets.size());
-    if (!source_offsets.empty()) {
-        std::vector<std::size_t> eligible_sources;
-        eligible_sources.reserve(source_offsets.size());
-        for (std::size_t i = 0; i < source_offsets.size(); ++i) {
-            if (source_offsets[i].end_bin > source_offsets[i].start_bin) {
-                eligible_sources.push_back(i);
-            }
+    std::vector<bool> source_has_trans(source_offsets.size(), false);
+    for (const auto &contact : source_matrix.contacts) {
+        if (contact.bin1 >= source_bin_to_contig.size() || contact.bin2 >= source_bin_to_contig.size() ||
+            !std::isfinite(contact.weight) || contact.weight <= 0.0) {
+            continue;
         }
-        if (!eligible_sources.empty()) {
-            std::mt19937_64 rng(seed);
-            std::uniform_int_distribution<std::size_t> pick_source(0, eligible_sources.size() - 1);
-            for (std::size_t target_index = 0; target_index < target_offsets.size(); ++target_index) {
-                const auto source_it = source_index_by_name.find(target_offsets[target_index].contig);
-                const std::size_t source_index =
-                    source_it != source_index_by_name.end() ? source_it->second : eligible_sources[pick_source(rng)];
-                targets_by_source[source_index].push_back(target_index);
-                if (source_it == source_index_by_name.end() && warnings != nullptr) {
-                    warnings->push_back("Target contig '" + target_offsets[target_index].contig +
-                                        "' is missing from matrix offsets; using source contig '" +
-                                        source_offsets[source_index].contig + "' as a template.");
-                }
-            }
+        const int contig1 = source_bin_to_contig[contact.bin1];
+        const int contig2 = source_bin_to_contig[contact.bin2];
+        if (contig1 >= 0 && contig2 >= 0 && contig1 != contig2) {
+            source_has_trans[static_cast<std::size_t>(contig1)] = true;
+            source_has_trans[static_cast<std::size_t>(contig2)] = true;
         }
     }
 
+    std::vector<std::vector<std::size_t>> targets_by_source(source_offsets.size());
+    if (!source_offsets.empty()) {
+        std::vector<bool> source_assigned(source_offsets.size(), false);
+        std::vector<bool> target_assigned(target_offsets.size(), false);
+
+        // Prefer same-name contigs, then pair the remaining entries by offset order.
+        for (std::size_t target_index = 0; target_index < target_offsets.size(); ++target_index) {
+            const auto source_it = source_index_by_name.find(target_offsets[target_index].contig);
+            if (source_it != source_index_by_name.end() && !source_assigned[source_it->second]) {
+                targets_by_source[source_it->second].push_back(target_index);
+                source_assigned[source_it->second] = true;
+                target_assigned[target_index] = true;
+            }
+        }
+        std::size_t next_source = 0;
+        std::vector<std::size_t> reusable_sources;
+        for (std::size_t source_index = 0; source_index < source_offsets.size(); ++source_index) {
+            if (source_has_trans[source_index]) {
+                reusable_sources.push_back(source_index);
+            }
+        }
+        std::mt19937_64 reuse_rng(seed);
+        std::shuffle(reusable_sources.begin(), reusable_sources.end(), reuse_rng);
+        std::size_t reuse_cursor = 0;
+        for (std::size_t target_index = 0; target_index < target_offsets.size(); ++target_index) {
+            if (target_assigned[target_index]) {
+                continue;
+            }
+            while (next_source < source_assigned.size() && source_assigned[next_source]) {
+                ++next_source;
+            }
+            if (next_source == source_assigned.size()) {
+                if (!force_contig_reuse) {
+                    throw std::runtime_error("Not enough source offset contigs to map the target reference.");
+                }
+                if (reusable_sources.empty()) {
+                    throw std::runtime_error("--force-contig-reuse requires at least two source contigs with "
+                                             "positive trans contacts; no reusable trans template is available.");
+                }
+                const std::size_t reused_source =
+                    reusable_sources[reuse_cursor++ % reusable_sources.size()];
+                targets_by_source[reused_source].push_back(target_index);
+                target_assigned[target_index] = true;
+                if (warnings != nullptr) {
+                    warnings->push_back("Target contig '" + target_offsets[target_index].contig +
+                                        "' reuses source contig '" +
+                                        source_offsets[reused_source].contig +
+                                        "' under --force-contig-reuse.");
+                }
+                continue;
+            }
+            targets_by_source[next_source].push_back(target_index);
+            source_assigned[next_source] = true;
+            if (warnings != nullptr) {
+                warnings->push_back("Target contig '" + target_offsets[target_index].contig +
+                                    "' has no matching source name; mapping by offset order to source contig '" +
+                                    source_offsets[next_source].contig + "'.");
+            }
+        }
+    }
     ContactWeightMap remapped_weights;
     remapped_weights.reserve(source_matrix.contacts.size() * 2);
+    bool warned_dropped_contacts = false;
+    bool warned_global_scaling = false;
 
     for (const auto &contact : source_matrix.contacts) {
         if (contact.weight <= 0.0 || !std::isfinite(contact.weight)) {
@@ -763,6 +823,14 @@ ContactMatrix remap_matrix_to_reference(const ContactMatrix &source_matrix,
                 }
                 mapped_ok = true;
             }
+
+            if (!mapped_ok) {
+                if (warnings != nullptr && !warned_dropped_contacts) {
+                    warnings->push_back("Dropping contacts from source contigs that are not mapped to the target reference.");
+                    warned_dropped_contacts = true;
+                }
+                continue;
+            }
         }
 
         if (!mapped_ok) {
@@ -770,9 +838,9 @@ ContactMatrix remap_matrix_to_reference(const ContactMatrix &source_matrix,
                 map_bin_by_scale(contact.bin1, source_matrix.bin_count, target_bin_count);
             const std::vector<WeightedBin> mapped_bins2 =
                 map_bin_by_scale(contact.bin2, source_matrix.bin_count, target_bin_count);
-            if (!source_offsets.empty() && warnings != nullptr) {
+            if (!source_offsets.empty() && warnings != nullptr && !warned_global_scaling) {
                 warnings->push_back("Falling back to global bin scaling for some contacts because they could not be mapped through contig offsets.");
-                warnings = nullptr;
+                warned_global_scaling = true;
             }
             for (const auto &mapped_bin1 : mapped_bins1) {
                 for (const auto &mapped_bin2 : mapped_bins2) {
@@ -781,6 +849,146 @@ ContactMatrix remap_matrix_to_reference(const ContactMatrix &source_matrix,
                                        mapped_bin2.bin,
                                        contact.weight * mapped_bin1.fraction * mapped_bin2.fraction);
                 }
+            }
+        }
+    }
+
+    if (force_contig_reuse) {
+        const std::vector<int> target_bin_to_contig =
+            build_contig_lookup_by_bin(target_bin_count, target_offsets);
+        const auto target_is_trans = [&](const ContactKey &key) {
+            const int contig1 = key.bin1 < target_bin_to_contig.size()
+                                    ? target_bin_to_contig[key.bin1]
+                                    : -1;
+            const int contig2 = key.bin2 < target_bin_to_contig.size()
+                                    ? target_bin_to_contig[key.bin2]
+                                    : -1;
+            return contig1 >= 0 && contig2 >= 0 && contig1 != contig2;
+        };
+
+        double baseline_trans_sum = 0.0;
+        for (const auto &[key, weight] : remapped_weights) {
+            if (target_is_trans(key) && std::isfinite(weight) && weight > 0.0) {
+                baseline_trans_sum += weight;
+            }
+        }
+
+        std::unordered_map<ContactKey, std::vector<const Contact *>, ContactKeyHash>
+            source_trans_by_pair;
+        for (const auto &contact : source_matrix.contacts) {
+            if (contact.bin1 >= source_bin_to_contig.size() || contact.bin2 >= source_bin_to_contig.size() ||
+                !std::isfinite(contact.weight) || contact.weight <= 0.0) {
+                continue;
+            }
+            const int contig1 = source_bin_to_contig[contact.bin1];
+            const int contig2 = source_bin_to_contig[contact.bin2];
+            if (contig1 >= 0 && contig2 >= 0 && contig1 != contig2) {
+                source_trans_by_pair[contact_key(static_cast<std::size_t>(contig1),
+                                                 static_cast<std::size_t>(contig2))]
+                    .push_back(&contact);
+            }
+        }
+
+        std::mt19937_64 donor_rng(seed + 32452843ULL);
+        std::size_t synthetic_pair_count = 0;
+        std::size_t logged_pair_count = 0;
+        for (std::size_t source_index = 0; source_index < targets_by_source.size(); ++source_index) {
+            const auto &target_indices = targets_by_source[source_index];
+            if (target_indices.size() < 2) {
+                continue;
+            }
+
+            std::vector<std::size_t> donor_sources;
+            for (std::size_t donor_index = 0; donor_index < source_offsets.size(); ++donor_index) {
+                if (donor_index != source_index &&
+                    source_trans_by_pair.find(contact_key(source_index, donor_index)) !=
+                        source_trans_by_pair.end()) {
+                    donor_sources.push_back(donor_index);
+                }
+            }
+            if (donor_sources.empty()) {
+                throw std::runtime_error("Reused source contig '" + source_offsets[source_index].contig +
+                                         "' has no positive trans block with another source contig.");
+            }
+            std::shuffle(donor_sources.begin(), donor_sources.end(), donor_rng);
+
+            std::size_t donor_cursor = 0;
+            for (std::size_t left_pos = 0; left_pos < target_indices.size(); ++left_pos) {
+                for (std::size_t right_pos = left_pos + 1; right_pos < target_indices.size(); ++right_pos) {
+                    const std::size_t donor_index =
+                        donor_sources[donor_cursor++ % donor_sources.size()];
+                    const auto pair_it =
+                        source_trans_by_pair.find(contact_key(source_index, donor_index));
+                    const OffsetEntry &source_offset = source_offsets[source_index];
+                    const OffsetEntry &donor_offset = source_offsets[donor_index];
+                    const OffsetEntry &left_target = target_offsets[target_indices[left_pos]];
+                    const OffsetEntry &right_target = target_offsets[target_indices[right_pos]];
+                    const double donor_pair_scale =
+                        1.0 / static_cast<double>(target_indices.size() *
+                                                  targets_by_source[donor_index].size());
+
+                    for (const Contact *contact : pair_it->second) {
+                        const int contact_contig1 = source_bin_to_contig[contact->bin1];
+                        const bool source_is_first =
+                            contact_contig1 == static_cast<int>(source_index);
+                        const std::size_t source_bin =
+                            source_is_first ? contact->bin1 : contact->bin2;
+                        const std::size_t donor_bin =
+                            source_is_first ? contact->bin2 : contact->bin1;
+                        const auto mapped_source_bins =
+                            map_bin_within_contig(source_bin, source_offset, left_target);
+                        const auto mapped_donor_bins =
+                            map_bin_within_contig(donor_bin, donor_offset, right_target);
+                        for (const auto &mapped_source : mapped_source_bins) {
+                            for (const auto &mapped_donor : mapped_donor_bins) {
+                                add_contact_weight(remapped_weights,
+                                                   mapped_source.bin,
+                                                   mapped_donor.bin,
+                                                   contact->weight * donor_pair_scale *
+                                                       mapped_source.fraction * mapped_donor.fraction);
+                            }
+                        }
+                    }
+
+                    ++synthetic_pair_count;
+                    if (warnings != nullptr && logged_pair_count < 20) {
+                        warnings->push_back("Synthetic trans block '" + left_target.contig +
+                                            "' <-> '" + right_target.contig + "' uses source trans '" +
+                                            source_offsets[source_index].contig + "' <-> '" +
+                                            source_offsets[donor_index].contig + "'.");
+                        ++logged_pair_count;
+                    }
+                }
+            }
+        }
+
+        if (synthetic_pair_count > 0) {
+            if (baseline_trans_sum <= std::numeric_limits<double>::min()) {
+                throw std::runtime_error("Cannot normalize forced contig reuse because the remapped matrix "
+                                         "has no positive baseline trans mass.");
+            }
+            double expanded_trans_sum = 0.0;
+            for (const auto &[key, weight] : remapped_weights) {
+                if (target_is_trans(key) && std::isfinite(weight) && weight > 0.0) {
+                    expanded_trans_sum += weight;
+                }
+            }
+            const double trans_scale = baseline_trans_sum / expanded_trans_sum;
+            for (auto &[key, weight] : remapped_weights) {
+                if (target_is_trans(key)) {
+                    weight *= trans_scale;
+                }
+            }
+            if (warnings != nullptr) {
+                if (synthetic_pair_count > logged_pair_count) {
+                    warnings->push_back("Additional synthetic trans blocks omitted from detailed log: " +
+                                        std::to_string(synthetic_pair_count - logged_pair_count) + ".");
+                }
+                warnings->push_back("Forced contig reuse synthesized " +
+                                    std::to_string(synthetic_pair_count) +
+                                    " duplicate-target trans block(s); trans mass normalized from " +
+                                    std::to_string(expanded_trans_sum) + " to " +
+                                    std::to_string(baseline_trans_sum) + ".");
             }
         }
     }
