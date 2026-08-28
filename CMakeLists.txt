@@ -17,5 +17,11 @@ add_executable(hicreate
     fragmenter.h
     simulator.cpp
     simulator.h
+    long_read_common.cpp
+    long_read_common.h
+    porec.cpp
+    porec.h
+    cifi.cpp
+    cifi.h
 )
 target_link_libraries(hicreate PRIVATE Threads::Threads)

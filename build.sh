@@ -6,4 +6,5 @@ output="hicreate"
 
 "$compiler" -std=c++17 -O2 -Wall -Wextra -pedantic -pthread \
   -o "$output" \
-  main.cpp matrix.cpp reference.cpp fragmenter.cpp simulator.cpp
+  main.cpp matrix.cpp reference.cpp fragmenter.cpp simulator.cpp \
+  long_read_common.cpp porec.cpp cifi.cpp

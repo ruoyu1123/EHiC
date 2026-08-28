@@ -7,7 +7,10 @@ $sources = @(
     "matrix.cpp",
     "reference.cpp",
     "fragmenter.cpp",
-    "simulator.cpp"
+    "simulator.cpp",
+    "long_read_common.cpp",
+    "porec.cpp",
+    "cifi.cpp"
 )
 
 & $compiler "-std=c++17" "-O2" "-Wall" "-Wextra" "-pedantic" "-pthread" "-o" $output @sources

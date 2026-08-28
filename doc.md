@@ -1,308 +1,433 @@
-# hicreate 算法说明
+# hicreate 方法与算法说明
 
-## 1. 软件设计目标
+## 1. 软件目标
 
-`hicreate` 是一个用于模�?Hi-C paired-end reads 的命令行程序。软件的目标是在给定参考基因组�?Hi-C 接触矩阵的条件下，生成符合输入接触频率分布的 150 bp paired-end FASTQ 数据。该程序既支持用户输入实验或人工构建�?Hi-C 矩阵，也支持在没有矩阵时根据参考基因组自动生成合成接触矩阵�?
-软件的核心思想是：先将基因组划分为固定大小�?bin，并�?Hi-C 矩阵解释�?bin �?bin 之间的接触概率分布；随后通过限制性酶切模型建�?bin �?restriction fragment 之间的映射；最后按照矩阵权重采样虚拟连接事件，并从对应 restriction fragment 的末端生�?paired-end reads�?
-因此，`hicreate` 的模拟过程不是简单地从全基因组均匀抽取 reads，而是�?Hi-C 矩阵为概率模型，显式模拟“接触矩�?-> 限制性片段连�?-> paired-end 测序 reads”的过程�?
-## 2. 输入与输�?
-软件主要输入包括�?
-- 参考基因组 FASTA 文件�?- bin size，用于将基因组划分为固定大小�?genomic bins�?- 可选的 Hi-C 接触矩阵�?- 可选的 offset 文件，用于描述矩�?bin 与参�?contig/chromosome 的对应关系；
-- 限制性内切酶识别序列�?- reads 数量、随机种子、线程数等模拟参数�?
-软件输出为两�?FASTQ 文件�?
-```text
-<prefix>_R1.fastq
-<prefix>_R2.fastq
+`hicreate` 根据参考基因组、限制性内切酶位点和接触矩阵模拟染色质构象捕获测序数据。当前支持三种 assay：
+
+- `hic`：150 bp Illumina 风格双端 Hi-C reads。
+- `porec`：Oxford Nanopore 风格的单分子多片段 Pore-C reads。
+- `cifi`：PacBio HiFi 风格的单分子多片段 CiFi reads。
+
+三种模式共用参考基因组、matrix、offset 和染色体级 matrix remap 流程，但 reads 构建与测序错误分别由独立模块实现。Hi-C 代码位于 `fragmenter.cpp` 和 `simulator.cpp`；Pore-C、CiFi 分别由 `porec.cpp`、`cifi.cpp` 调用 `long_read_common.cpp` 中的长 concatemer 生成框架。
+
+基本命令格式为：
+
+```bash
+./hicreate ref.fa BIN_SIZE --assay hic|porec|cifi [options]
 ```
 
-每一�?reads 对应一个模拟的 Hi-C 连接事件。FASTQ header 中包含该 read pair 来源的两�?bin 编号，因此可以直接从输出 reads 重建模拟后的 Hi-C contact map。例如：
+不指定 `--assay` 时使用 `hic`，因此旧的 Hi-C 命令保持兼容。
+
+## 2. 共同输入和矩阵处理
+
+### 2.1 参考基因组与全局 bin
+
+程序读取 FASTA 中的每条 contig，以 header 第一个字段作为 contig 名称，并根据 `BIN_SIZE` 计算每条 contig 的 bin 数：
 
 ```text
-@hicreate_123_bin10_bin45/1
+contig_bins = ceil(contig_length / BIN_SIZE)
 ```
 
-表示�?123 �?read pair 来自 bin 10 �?bin 45 之间的接触事件�?
-## 3. 总体算法流程
-
-`hicreate` 的整体流程如下：
-
-1. 读取参考基因组 FASTA�?2. 根据 bin size 构建全局 bin 坐标系统�?3. 读取用户输入�?Hi-C 矩阵，或生成合成 Hi-C 矩阵�?4. 根据 offset 将输入矩阵映射到当前参考基因组�?5. 对参考基因组进行 in silico restriction digestion�?6. 建立 bin �?restriction fragments 的索引；
-7. 根据 contact matrix 权重采样 bin-bin 接触�?8. 从对�?bins 中采�?restriction fragments�?9. 构造虚�?ligation junction�?10. 生成 150 bp paired-end read templates�?11. 添加测序质量值和碱基替换错误�?12. 写出 R1/R2 FASTQ 文件�?
-## 4. 参考基因组读取与分�?
-程序首先读取输入 FASTA 文件。每条序列记录被解析为一�?contig，序列中的碱基统一转换为大写。空白字符会被忽略，FASTA header 的第一个字段作�?contig 名称�?
-对于每条 contig，程序根据用户指定的 `bin_size` 计算�?bin 数：
+不同 contig 的 bin 按 FASTA 顺序连接成全局 bin 坐标。内部 reference offset 使用以下形式：
 
 ```text
-contig_bins = ceil(contig_length / bin_size)
+contig  start_bin  end_bin
 ```
 
-多个 contig 会被拼接到同一个全局 bin 坐标系统中。程序为参考基因组生成 offset 表：
+其中 `start_bin` 为闭区间起点，`end_bin` 为开区间终点。
+
+### 2.2 Matrix 和 offset
+
+Matrix 支持 sparse、dense 和 binary sparse 格式。Sparse 格式为：
 
 ```text
-contig    start_bin    end_bin
+bin1  bin2  weight
 ```
 
-其中 `start_bin` 为该 contig 在全局 bin 坐标中的起始位置，`end_bin` 为开区间终点。该 offset 表用于判断两�?bins 是否属于同一 contig，也用于后续矩阵重映射和 cis/trans 接触统计�?
-## 5. Hi-C 接触矩阵处理
-
-### 5.1 自定义矩阵输�?
-如果用户提供 `--matrix`，程序读取用户指定的 Hi-C 接触矩阵。矩阵支持两种格式�?
-sparse 格式�?
-```text
-bin1    bin2    value
-0       0       100
-0       1       45
-1       5       12
-```
-
-dense 格式�?
-```text
-100 45 12
-45  90 18
-12  18 80
-```
-
-矩阵格式可通过命令行参数显式指定：
+每个正的有限 `weight` 被解释为对应 bin pair 的相对接触强度。用于直接采样时：
 
 ```text
---matrix-format auto|sparse|dense
+P(contact_i) = weight_i / sum(all usable weights)
 ```
 
-默认 `auto` 会根据输入内容自动判断。对�?3 x 3 dense 矩阵，由于其行数�?sparse 三列表达形式存在歧义，建议显式使用：
+用户 offset 支持两种格式：
 
 ```text
---matrix-format dense
+contig  start_bin  end_bin
 ```
 
-程序内部统一将矩阵转换为 sparse contact 列表�?
-```text
-Contact = (bin1, bin2, weight)
-```
-
-其中 `weight` 表示两个 bins 之间的相对接触强度。非正权重和非有限数值会被忽略。对�?sparse 输入，如果同一 bin pair 出现多次，程序会将其权重累加�?
-### 5.2 输入矩阵�?cis/trans 含义
-
-对于自定义输入矩阵，程序默认保留矩阵本身�?cis/trans 权重分布。也就是说，如果输入矩阵�?trans 接触较强，模�?reads �?trans 接触也会相应增强；如果输入矩阵中没有 trans 接触，程序不会默认强行添�?trans 接触�?
-只有当用户显式指定：
+或 hicmap 四列格式：
 
 ```text
---trans-ratio X
+name  bin_offset  length  bin_num
 ```
 
-时，程序才会对矩阵进�?cis/trans 重平衡，�?trans 权重占总权重的比例接近 `X`�?
-```text
-trans_fraction = trans_weight / (cis_weight + trans_weight)
-```
-
-该设计使得用户输入的真实或外部模拟矩阵能够作为主要概率模型，同时仍允许用户在需要时手动控制 trans 接触比例�?
-### 5.3 矩阵重映�?
-输入矩阵�?bin 坐标可能来自与当前参考基因组不同�?assembly、不同长度的模板，或不同�?contig 集合。因此，程序支持通过 offset 文件将输入矩阵映射到目标参考基因组�?
-�?source offset �?target reference offset 中存在同�?contig 时，程序�?contig 内相对位置进行缩放映射：
+四列格式按以下方式转换：
 
 ```text
-source_bin within source_contig
-    -> proportional target_bin within target_contig
+start_bin = bin_offset
+end_bin   = bin_offset + bin_num
 ```
 
-如果某些 contact 无法通过 contig 名称匹配，程序退化为全局比例缩放，即根据 source matrix 的�?bin 数和 target reference 的�?bin 数进行映射�?
-如果输入矩阵只覆盖目标参考的一部分，程序会根据覆盖比例混合输入矩阵和合成背景矩阵。覆盖比例越高，输入矩阵权重占比越大；覆盖比例不足时，合成矩阵用于填补缺失信号�?
-### 5.4 经验矩阵模型�?
-仅依靠程序化规则从零生成 Hi-C 矩阵时，得到的热图形态可能难以稳定接近真实数据。为此，`hicreate` 支持经验矩阵模型库。模型库中的每个模型由真实或预先整理好的 Hi-C matrix �?offset 组成�?
-```text
-models/<model-name>/
-  manifest.tsv
-  matrix.tsv
-  offset.tsv
-```
+`length` 列仅用于兼容，不参与 bin 区间计算。
 
-`manifest.tsv` 记录矩阵文件、offset 文件和格式：
+### 2.3 Matrix 与参考基因组不匹配
 
-```text
-name    human_cell_40mb
-matrix  matrix.tsv
-offset  offset.tsv
-format  dense
-```
+程序首先检查 source offset 是否与 reference offset 完全一致。只有 contig 数量、名称、顺序和 bin 区间全部相同时，matrix 才直接进入模拟。
 
-支持的矩阵格式包�?text sparse、text dense 和紧�?binary sparse。用户可以通过�?
-```text
---empirical-model human_cell_40mb
-```
+如果不一致，则执行染色体级 remap：
 
-直接调用模型库�?
-如果用户没有提供自己的矩阵，经验模型会被重映射到目标参考基因组，并作为完整 contact matrix 使用。如果用户同时提供了自己的矩阵和经验模型，则程序执行 trans-only replacement�?
-1. 用户输入矩阵经过 remapping 后作�?base matrix�?2. base matrix 中所�?cis contacts 保留不变�?3. 经验模型矩阵经过 remapping 后只提取 trans contacts�?4. 经验模型 trans contacts resize、归一化后替换 base matrix 中原�?trans contacts�?5. 如果显式指定 `--trans-ratio`，替换后�?trans 总量按目标比例缩放；否则默认缩放到用户输入矩阵原�?trans 总量�?
-这样可以实现�?
-```text
-final_matrix = user_cis + empirical_model_trans
-```
+1. 优先匹配同名 source 和 target contig。
+2. 剩余 contig 按 offset 顺序一一对应。
+3. 每条 source contig 的完整 bin 区间按比例缩放到对应 target contig，而不是截断或用其他染色体补齐长度。
+4. Cis contact 在同一对 source/target contig 内缩放。
+5. Trans contact 按对应的 source contig pair 映射到 target contig pair。
+6. 一个 source bin 映射到非整数 target 位置时，权重在相邻 target bins 之间分配。
 
-该模式适合“用户热图提供样本特�?cis 结构，模型库提供可信 trans 架构”的场景，比完全手写 rule-based trans 模型更接近真�?Hi-C 数据�?
-## 6. 合成 Hi-C 矩阵生成
+默认要求 source offset 的 contig 数量不少于参考基因组。使用 `--force-contig-reuse` 可以强制复用 source contig；复制 target 之间的 trans block 从真实 source trans block 合成，并对最终 trans 总量归一化。
 
-当用户未提供输入矩阵时，`hicreate` 会根据参考基因组自动生成合成 Hi-C 矩阵。合成矩阵由 cis �?trans 两部分组成�?
-### 6.1 cis 接触模型
+未提供 matrix 时，程序加载 `--species-model` 或 `--empirical-model` 指定的经验矩阵，并执行相同的 offset 检查和 remap。
 
-cis 接触表示同一 contig/chromosome 内部的接触。程序使用距离衰减模型描�?cis 接触概率�?
-```text
-weight(d) �?1 / (d + 1)^alpha
-```
-
-其中 `d` 为两�?bins 之间的距离，`alpha` �?cis decay exponent。距离越近，接触权重越高。主对角线附近的 bins 因距离较短而具有较强接触信号�?
-程序还支持设置最小和最�?cis 距离�?
-```text
-```
-
-默认情况下允�?same-bin contact，从而保�?Hi-C 矩阵中常见的强主对角线�?
-### 6.2 trans 接触模型
-
-trans 接触表示不同 contigs/chromosomes 之间的接触。程序通过 `trans_ratio` 控制 trans 接触总权重占比，并结合物种模型和染色体空间排布模型生�?trans 接触�?
-支持的空间模型包括：
-
-- territory：染色体领地模型�?- rabl：Rabl 构型�?- rosette：Rosette-like 构型�?- nonrabl：非 Rabl 构型�?- custom：由用户输入的染色体三维空间布局�?
-支持�?trans interaction 模型包括�?
-- random：随机碰撞背景；
-- territory / spatial / global-folding：基于染色体空间距离的接触；
-- telomere：端�?亚端粒富集；
-- centromere：着丝粒或近着丝粒区域富集�?- compartment / checkerboard：跨染色�?compartment-like 接触�?- hubs：若�?trans hotspot�?
-这些模型用于在没有实验矩阵时生成具有一定生物学结构的合�?Hi-C contact map�?
-### 6.3 用户指定染色体空间排�?
-布局文件格式为：
+同时提供用户 matrix 和 `--empirical-model` 时：
 
 ```text
-contig    x      y      z
-chr1      0.0    0.0    0.0
-chr2      0.8    0.1    0.2
-chr3     -0.4    0.7   -0.1
+final_matrix = user_matrix_cis + empirical_model_trans
 ```
 
-其中 `contig` 必须�?FASTA �?offset 中的 contig 名称一致，`x/y/z` 为任意三维坐标系中的染色体中心位置。坐标单位不要求具有绝对物理意义，但相对距离会影�?trans 接触强度�?
-当提供布局文件时，程序首先仍根据物种或 arrangement preset 生成一组默认染色体中心；随后用布局文件中匹配到�?contig 坐标覆盖默认中心。对于每一对不同染色体 `i` �?`j`，程序计算其三维距离�?
-```text
-d(i, j) = sqrt((xi - xj)^2 + (yi - yj)^2 + (zi - zj)^2)
+经验 trans 会先映射到目标参考，再缩放到用户 matrix 原有的 trans 总量；显式指定 `--trans-ratio` 时，改为缩放到目标 trans 比例。
+
+## 3. Hi-C reads 模拟方法
+
+### 3.1 使用方式和输出
+
+```bash
+./hicreate ref.fa 1000 --assay hic \
+  --matrix matrix.tsv --offset offset.tsv \
+  --pairs 100000 --enzyme-site AAGCTT \
+  --output-prefix sim
 ```
 
-并将空间距离转换�?trans 染色体对权重�?
-```text
-arranged_weight(i, j) = 1 / (d(i, j) + 0.25)^gamma
-```
-
-同时，程序保留一个随机碰撞背景项�?
-```text
-```
-
-最�?trans 染色体对的采样权重为�?
-```text
-pair_weight(i, j) = bins_i * bins_j * mixed_weight
-```
-
-其中 `bins_i` �?`bins_j` 分别表示两条染色体的 bin 数。这样，空间距离更近的染色体对会产生更强�?trans 接触信号；距离更远的染色体对则被削弱。该设计使用户能够显式模�?Rabl-like、rosette-like、territory-like、全局折叠或由外部 3D 建模得到的染色体空间构型�?
-
-## 7. 限制性酶切模�?
-Hi-C 实验中，基因�?DNA 通常经过限制性内切酶切割。因此，`hicreate` �?reads 生成前对参考基因组执行 in silico restriction digestion�?
-用户可通过以下参数指定酶切识别序列�?
-```text
---enzyme-site AAGCTT
-```
-
-程序会将输入的酶切位点统一转换为大写，因此 `aagctt` �?`AAGCTT` 等价�?
-对于常见酶切位点，程序使用内�?cut offset�?
-```text
-AAGCTT  HindIII, A|AGCTT
-GATC    DpnII/MboI, ^GATC
-```
-
-对于其他酶切位点，程序默认使�?motif 中点作为切割位置�?
-每个 restriction fragment 记录如下信息�?
-```text
-fragment_id
-contig_index
-start
-end
-```
-
-随后程序建立 bin �?fragments 的索引。如果一�?fragment 跨越多个 bins，则�?fragment 会被加入所有对�?bins 的候�?fragment 列表�?
-## 8. 接触事件采样
-
-程序�?contact matrix 中的每个 contact 权重解释为采样概率。对�?contact `i`�?
-```text
-P(contact_i) = weight_i / sum(weight)
-```
-
-程序首先根据所�?contacts 的权重构建累计分布，然后对每�?read pair 采样一�?bin-bin 接触�?
-```text
-(bin1, bin2)
-```
-
-接着，程序分别从 `bin1` �?`bin2` 对应�?restriction fragment 候选集合中随机选择一�?fragment，形成一个虚�?ligation event�?
-如果 contact 来自同一�?bin 或相�?bins，两个端点可能采样到同一�?fragment。程序会尝试避免完全相同�?fragment 自连接，但当候�?fragment 数量有限时，仍允许这种事件存在。这种设计保留了�?bin、低酶切密度或局部强接触区域中的真实边界情况�?
-## 9. 虚拟连接分子构建
-
-对于每个采样到的 ligation event，程序从两个 restriction fragments 的末端向外截取序列，并构�?read template�?
-每个 fragment 的末端方向会随机选择�?
-- left end�?- right end 的反向互补序列�?
-程序根据酶切位点构�?ligation junction。随后生�?read1 �?read2 的模板：
+输出为：
 
 ```text
-read1_template = left_fragment_end + junction + right_fragment_end
-read2_template = right_fragment_end + junction + left_fragment_end
+sim_R1.fastq
+sim_R2.fastq
 ```
 
-如果 fragment 末端序列不足以生�?150 bp reads，程序会继续使用 junction 和另一�?fragment 序列补足。如果仍不足，则使用 `N` padding�?
-该方法避免了显式构建完整的长 ligation molecule，同时保留了 Hi-C reads 由限制性片段末端和连接位点组成的核心特征�?
-## 10. 测序质量与错误模�?
-`hicreate` 在生�?read template 后，会进一步模�?Illumina-like 测序质量和碱基替换错误�?
-质量值沿 read 位置变化：read 5' 端质量较高，�?3' 端逐渐下降。对于每个碱基位置，程序采样一�?Phred quality score `Q`，并根据 Phred 定义计算错误概率�?
+Hi-C 固定生成 150 bp paired-end reads。`--pairs N` 精确控制 R1、R2 各自的 FASTQ record 数。使用 coverage 时：
+
+```text
+pairs = ceil(coverage * reference_bases / (2 * 150))
+```
+
+### 3.2 In silico 酶切
+
+Hi-C 默认酶切 motif 为 HindIII `AAGCTT`，切点为 `A|AGCTT`。`GATC` 按 DpnII/MboI 的 `^GATC` 处理；其他 motif 使用中点作为近似切点。
+
+程序扫描每条 contig 并建立 restriction fragments：
+
+```text
+fragment_id, contig_index, start, end
+```
+
+如果一个 fragment 跨越多个 genomic bins，它会进入每个重叠 bin 的候选 fragment 集合。
+
+### 3.3 接触和片段抽样
+
+每个 read pair 首先按 matrix 权重抽取一个 `(bin1, bin2)` contact。随后分别从两个 bin 的候选 restriction fragments 中随机抽取一个片段。
+
+程序会尝试避免两个端点选择同一个 fragment；如果候选片段不足，仍可能保留自连接事件。两个 fragment 分别随机选择左端或右端，右端以反向互补序列表示。
+
+### 3.4 虚拟连接和随机 read 起点
+
+程序为两个 fragment ends 构造两个方向的虚拟连接 scaffold：
+
+```text
+R1 scaffold = left_end  + ligation_junction + right_end
+R2 scaffold = right_end + ligation_junction + left_end
+```
+
+随后在 scaffold 可用范围内随机抽取一个起始 offset，并从 R1、R2 scaffold 的对应位置分别截取 150 bp。因此 reads 并非总是固定从 fragment 的同一碱基开始。
+
+如果 scaffold 不足 150 bp，剩余位置使用 `N` 补齐。
+
+### 3.5 Illumina 质量和错误
+
+质量值使用位置相关的 Illumina-like 模型：5' 端平均质量较高，向 3' 端逐渐下降。每个位置根据 Phred Q 计算 substitution 概率：
+
 ```text
 P(error) = 10^(-Q / 10)
 ```
 
-当某个碱基发生错误时，程序会从其他三种碱基中随机选择一个替换。`N` 碱基不会被替换�?
-最终，程序为每�?read 输出�?
-```text
-@read_name
-sequence
-+
-quality
+发生错误时，从其余三种碱基中随机选择替换碱基。当前 Hi-C 模块不模拟 indel。
+
+## 4. Pore-C reads 模拟方法
+
+### 4.1 建库过程对应关系
+
+实验 Pore-C 的核心步骤是交联染色质、限制性酶切、近距离连接、解除交联、长片段 size selection、Nanopore adapter ligation 和单分子测序。一个 basecalled read 可以包含两个或更多来自不同基因组位置的 restriction fragments，因此能够表示 multi-way contact。
+
+本程序模拟的是 Pore-C 的 basecalled FASTQ 层，不模拟 Nanopore 电流信号、basecaller、DNA 修饰或甲基化信号。
+
+### 4.2 使用方式和输出
+
+```bash
+./hicreate ref.fa 1000 --assay porec \
+  --matrix matrix.tsv --offset offset.tsv \
+  --reads 10000 --threads 8 \
+  --output-prefix porec_sim
 ```
 
-并分别写�?R1 �?R2 FASTQ 文件�?
-## 11. 多线程与可复现�?
-程序支持多线程生�?reads。为避免多线程写文件带来的锁竞争，`hicreate` �?reads 生成划分为多个固定大小的 block。worker threads 负责生成 FASTQ block，主线程�?block 顺序写入文件�?
-这种设计具有两个优点�?
-1. 内存占用不会随�?reads 数线性增长；
-2. 输出顺序稳定，便于复现和下游比较�?
-随机数由用户指定�?seed 初始化。每�?block 使用由全局 seed 派生的确定性随机流，从而减少线程调度对结果的影响�?
-## 12. �?reads 重建 Hi-C 热图
+Pore-C 默认使用 DpnII/MboI motif `GATC`。输出为：
 
-由于每个 FASTQ header 中包含来�?bin 信息，输�?reads 可直接用于重建模�?contact map。对于每�?R1 header�?
 ```text
-@hicreate_<id>_bin<i>_bin<j>/1
+porec_sim_porec.fastq
+porec_sim_porec_truth.tsv
 ```
 
-解析其中�?`i` �?`j`，并将矩阵中对应位置加一�?
+Truth TSV 每行对应一个 concatemer segment：
+
 ```text
-M[i, j] += 1
-M[j, i] += 1, if i != j
+read_name
+segment_order
+contig
+start
+end
+strand
+matrix_bin
+template_start
+template_end
 ```
 
-这样得到�?reads-derived contact map 可以与输入矩阵或目标热图进行比较，用于评估模�?reads 是否保留了原�?Hi-C 矩阵结构�?
-## 13. 算法特点
+基因组坐标使用 0-based、end-exclusive 形式；`template_start/end` 是加入测序错误之前的 concatemer template 坐标。
 
-`hicreate` 的主要特点包括：
+### 4.3 Pore-C concatemer 长度
 
-- �?Hi-C contact matrix 作为核心概率模型�?- 支持自定�?sparse/dense 矩阵输入�?- 支持 source matrix �?target reference �?bin-level 重映射；
-- 保留 `--species-model` 作为物种级默认预设，同时允许用户用空间布局覆盖预设�?- 显式模拟限制性酶切片段；
-- 根据 restriction fragment 端点构造虚�?ligation reads�?- 支持 Illumina-like 质量值和替换错误�?- 支持多线程流�?FASTQ 输出�?- 输出 read header 保留 contact bin 信息，便于质量控制和热图重建�?- 在自定义矩阵模式下默认保留输入矩阵的 cis/trans 权重比例，仅在用户显式指�?`--trans-ratio` 时进行重平衡�?
-## 14. 方法学总结
+每条 read 的目标 template 长度来自 lognormal 分布。默认参数为：
 
-总体而言，`hicreate` �?Hi-C reads 模拟问题分解为三个层次：
+```text
+mean length     = 10000 bp
+minimum length = 3000 bp
+maximum length = 100000 bp
+log sigma       = 0.80
+```
 
-1. **接触概率�?*：由输入矩阵或合成矩阵定�?bin-bin 接触概率�?2. **基因组片段层**：由参考基因组和酶切位点定�?restriction fragments�?3. **测序 reads �?*：由 sampled ligation events 生成 paired-end reads，并加入测序质量和错误�?
-这种分层设计使得软件既可以忠实地根据用户提供�?Hi-C 矩阵生成 reads，也可以在没有实验矩阵时生成具有基本生物学结构的合成 Hi-C reads。新增的染色体空间布局参数使模拟不再只能依赖粗粒度物种标签，而是可以直接围绕 Rabl、rosette、territory、checkerboard 或外�?3D 建模结果等具体空间构型设计实验。由于矩阵、offset、空间布局、酶切模型和随机种子均可由用户控制，`hicreate` 适用�?Hi-C pipeline 测试、算�?benchmark、参数敏感性分析以及不同接触模式下的模拟实验�?
+抽样结果被限制在 minimum 和 maximum 之间。可以通过以下参数覆盖：
 
-## ��ǰ�������ģ��˵��
+```text
+--long-read-mean
+--long-read-min
+--long-read-max
+--long-read-sigma
+```
 
-��ǰ�汾���Ƴ� rule-based Hi-C �������ɲ����Ͷ�Ӧ����������Ĭ������£�����û����ṩ --matrix���������� --species-model ѡ�� models/ �еľ������ģ�ͣ������� remap ��Ŀ��ο����������Ϊ���� contact matrix ʹ�á����û��ṩ�Զ�����������Զ������� cis �Ӵ��ṹ�����þ���ģ���е� trans �Ӵ����� resize��remap �͹�һ�����滻ԭʼ trans ���顣--trans-ratio �������������о��� trans �Ӵ�����������������ȱʧ�� rule-based trans contacts��
+`--long-read-sigma 0` 表示使用固定目标长度。
 
+### 4.4 首个 contact 和 anchor 模型
 
+输入 matrix 是二元接触矩阵，不能唯一决定三个及以上片段的联合分布。因此程序使用 anchor 模型构造高阶 concatemer。
+
+第一步严格按 matrix 总权重抽取一个 contact：
+
+```text
+(bin1, bin2) ~ matrix weights
+```
+
+两个端点的顺序随机交换，交换后的第一个 bin 成为该 concatemer 的 `anchor_bin`。前两个 segment 分别来自这两个 bins。
+
+对于第三个及后续 segment，程序从 anchor 的邻接接触分布中抽样：
+
+```text
+P(next_bin = j | anchor = i)
+    = weight(i, j) / sum_k weight(i, k)
+```
+
+这里始终使用同一个 anchor，而不是从上一 segment 继续随机游走。这样可以避免一次 trans 跳转让后续大量片段持续停留在另一条染色体，进而在 all-vs-all 展开时人为放大 trans 信号。
+
+### 4.5 Segment 和连接序列构造
+
+对每个 sampled bin，程序从与该 bin 重叠的 restriction fragments 中随机选一个片段，并尽量避免连续两次使用同一 fragment。
+
+每个 segment 的方向独立随机：
+
+- `+`：使用参考序列正向片段。
+- `-`：使用对应片段的反向互补序列。
+
+相邻 segments 之间插入根据酶切 motif 构造的 canonical ligation junction。程序持续增加 segments，直到达到抽样的目标 template 长度或 `--max-segments`。默认最大值为 256；如果先达到 segment 上限，程序会报告 warning 和 `Segment-limited reads` 数量。
+
+首尾 segment 必要时可以只使用 restriction fragment 的一部分，以模拟 size selection 或测序分子边界。每条输出 read 至少包含两个 truth segments。
+
+### 4.6 Nanopore 风格测序错误
+
+Pore-C 默认平均 QV 为 13，位置 QV 从标准差为 2 的正态分布抽样，并限制在 Q2 到 Q41。每个 template base 的总错误概率为：
+
+```text
+P(error) = 10^(-Q / 10)
+```
+
+错误类型默认按以下比例分配：
+
+```text
+deletion      45%
+substitution  25%
+insertion     30%
+```
+
+Deletion 不输出该 template base；substitution 输出随机替换碱基；insertion 在当前碱基后增加随机碱基。最终 FASTQ sequence 和 quality 长度始终一致。`--long-read-qv` 可以覆盖平均 QV。
+
+## 5. CiFi reads 模拟方法
+
+### 5.1 建库过程对应关系
+
+CiFi 将 3C concatemer 与 PacBio HiFi 测序结合。实验流程包括交联、DpnII 或 HindIII 酶切、近距离连接、解除交联、whole-genome PCR enrichment、SMRTbell library preparation、长片段 size selection 和 CCS/HiFi sequencing。
+
+本程序直接模拟最终 HiFi consensus FASTQ，不模拟 polymerase raw read、SMRTbell 环形序列、不同 pass 数量或 CCS consensus 计算过程。
+
+### 5.2 使用方式和输出
+
+```bash
+./hicreate ref.fa 1000 --assay cifi \
+  --matrix matrix.tsv --offset offset.tsv \
+  --coverage 5 --threads 8 \
+  --output-prefix cifi_sim
+```
+
+CiFi 默认使用 `GATC`，也可以显式指定 HindIII：
+
+```text
+--enzyme-site AAGCTT
+```
+
+输出为：
+
+```text
+cifi_sim_cifi.fastq
+cifi_sim_cifi_truth.tsv
+```
+
+Truth TSV 的字段和坐标规则与 Pore-C 相同。
+
+### 5.3 CiFi concatemer 构造
+
+CiFi 与 Pore-C 使用相同的 restriction fragment index、首个 matrix contact 抽样和 anchor 条件分布。区别主要来自 read 长度、测序精度和 PCR duplicate 模型，而不是使用另一套 contact matrix。
+
+默认长度参数来自已发表 CiFi 数据的近似统计：
+
+```text
+mean length     = 9350 bp
+minimum length = 5000 bp
+maximum length = 25000 bp
+log sigma       = 0.65
+```
+
+限制性酶会自然影响 segments 数量。DpnII 位点更密集，同样长度的 concatemer 通常包含更多、较短的 segments；HindIII 位点更稀疏，通常包含更少、较长的 segments。程序不直接强制使用“DpnII 17 段”或“HindIII 2 段”，而是由参考序列中的真实 motif 密度和目标 read 长度共同决定。
+
+### 5.4 HiFi 质量和错误
+
+CiFi 默认平均 QV 为 38，QV 标准差为 1.5，并限制在 Q2 到 Q41。错误概率仍按 Phred 定义计算，但显著低于 Pore-C。
+
+默认错误类型比例为：
+
+```text
+substitution  55%
+deletion      25%
+insertion     20%
+```
+
+这些错误施加在 concatemer template 上，输出代表完成 CCS 后的高准确度 HiFi read。
+
+### 5.5 PCR template duplicate
+
+CiFi 建库包含 PCR enrichment。程序默认以 1.8% 概率复用同一 FASTQ block 中先前生成的 concatemer template：
+
+```text
+template_duplicate_rate = 0.018
+```
+
+Duplicate read 使用相同的 source segments、坐标、方向和连接结构，但重新独立采样 HiFi 测序错误。Duplicate read 名称包含：
+
+```text
+_dup<SOURCE_READ_ID>
+```
+
+Pore-C 不使用该 PCR duplicate 模型。
+
+## 6. 三种模式比较
+
+| 特征 | Hi-C | Pore-C | CiFi |
+|---|---|---|---|
+| 输出形态 | PE150 | 单端长 read | 单端 HiFi 长 read |
+| 每条 read 的 segment 数 | 2 个连接端 | 至少 2 个 | 至少 2 个 |
+| 默认酶切 motif | `AAGCTT` | `GATC` | `GATC` |
+| Matrix 用法 | 每个 pair 直接抽一个 contact | 首对直接抽样，后续围绕 anchor | 首对直接抽样，后续围绕 anchor |
+| 默认平均长度 | 2 x 150 bp | 10 kb | 9.35 kb |
+| 默认平均 QV | Illumina 位置模型 | Q13 | Q38 |
+| Indel | 不模拟 | 模拟 | 模拟，比例较低 |
+| PCR duplicate | 不模拟 | 不模拟 | 默认 1.8% template duplicate |
+| Truth TSV | 无 | 有 | 有 |
+
+## 7. Reads 数量和 coverage
+
+Hi-C 使用：
+
+```text
+--pairs N
+```
+
+Pore-C、CiFi 使用：
+
+```text
+--reads N
+```
+
+`--reads` 精确控制单端长 read record 数量。长 read coverage 模式先按配置的平均长度换算 read 数：
+
+```text
+reads = ceil(coverage * reference_bases / configured_mean_read_length)
+```
+
+由于实际长度来自随机分布，并且 insertion/deletion 会改变输出碱基数，最终 coverage 可能略高或略低。程序结束时按实际 FASTQ 碱基数报告：
+
+```text
+actual_coverage = sequenced_bases / reference_bases
+```
+
+`--coverage` 不能与 `--pairs` 或 `--reads` 同时使用。
+
+## 8. 多线程、内存和可复现性
+
+三种模式都将 reads 分成有界 block，由 worker threads 负责抽样、构建模板、模拟错误和格式化 FASTQ，主线程按 block 编号顺序写盘。
+
+长 read block 大小会根据平均 read 长度动态调整，避免超长 read 时一次预留过多内存。ready queue 有容量限制，但 writer 正在等待的 block 可以越过容量限制进入队列，从而避免乱序 worker 导致死锁。
+
+每个 block 使用由全局 `--seed` 和 block 编号派生的随机流。因此在参数、输入和 seed 相同的情况下，改变线程数不会改变 FASTQ 和 truth TSV 内容。
+
+## 9. 高阶接触的解释和限制
+
+Pore-C 和 CiFi 的一条 concatemer 可以拆分成 `n` 个 segments，并产生 `n * (n - 1) / 2` 个 all-vs-all pairwise contacts。输入 matrix 只提供二元边缘分布，不包含以下信息：
+
+- 哪些三个或更多 loci 同时存在于一个细胞复合物中。
+- Multi-way complex 中各 segments 的联合概率。
+- Segment 在连接分子中的真实物理顺序。
+
+因此不存在从普通 Hi-C matrix 到唯一 Pore-C/CiFi concatemer 集合的精确逆变换。当前 anchor 模型能保持首个 contact 精确服从 matrix，并避免明显的跨染色体随机游走，但将所有 concatemer 做 all-vs-all 展开后，不保证每个像素或 cis/trans 比例与输入 matrix 完全相等。
+
+需要严格评估时，应使用 truth TSV 重建：
+
+1. 相邻 segment contacts。
+2. Anchor-to-all contacts。
+3. All-vs-all contacts。
+
+比较三种统计与输入 matrix 后，再针对具体下游 pipeline 校准长度分布、`--max-segments`、酶切 motif 或额外的高阶模型。
+
+## 10. 方法依据
+
+Pore-C 模型参考：
+
+- Deshpande et al. *Nanopore sequencing of DNA concatemers reveals higher-order features of chromatin structure*. DOI: `10.1101/833590`。
+- Zhong et al. *High-throughput Pore-C reveals the single-allele topology and cell type-specificity of 3D genome folding*. DOI: `10.1038/s41467-023-36899-x`。
+
+CiFi 模型参考：
+
+- McGinty et al. *CiFi: accurate long-read chromosome conformation capture with low-input requirements*. DOI: `10.1038/s41467-025-66918-y`。
+- *CiFi: 3C Library Preparation for PacBio HiFi Sequencing*. DOI: `10.17504/protocols.io.4r3l21zxpg1y/v1`。

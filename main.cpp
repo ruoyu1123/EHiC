@@ -1,6 +1,8 @@
 #include "config.h"
+#include "cifi.h"
 #include "fragmenter.h"
 #include "matrix.h"
+#include "porec.h"
 #include "reference.h"
 #include "simulator.h"
 #include <algorithm>
@@ -23,6 +25,29 @@ std::string to_lower(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(),
                    [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
     return value;
+}
+
+AssayType parse_assay_type(const std::string &value) {
+    const std::string assay = to_lower(value);
+    if (assay == "hic" || assay == "hi-c") {
+        return AssayType::Hic;
+    }
+    if (assay == "porec" || assay == "pore-c") {
+        return AssayType::PoreC;
+    }
+    if (assay == "cifi" || assay == "ci-fi") {
+        return AssayType::CiFi;
+    }
+    throw std::runtime_error("--assay must be one of: hic, porec, cifi.");
+}
+
+std::string assay_type_to_string(AssayType assay) {
+    switch (assay) {
+        case AssayType::Hic: return "hic";
+        case AssayType::PoreC: return "porec";
+        case AssayType::CiFi: return "cifi";
+    }
+    return "unknown";
 }
 
 MatrixFormat parse_matrix_format(const std::string &value) {
@@ -273,6 +298,10 @@ void print_usage() {
         << "Usage:\n"
         << "  hicreate ref.fa 10000 [options]\n"
         << "  hicreate --reference ref.fa --bin-size 10000 [options]\n\n"
+        << "Assay selection:\n"
+        << "      --assay TYPE       hic, porec, or cifi. Default: hic\n"
+        << "                         Hi-C writes PE150 FASTQ; Pore-C and CiFi write\n"
+        << "                         single-molecule concatemer FASTQ plus truth TSV.\n\n"
         << "Required positional arguments:\n"
         << "  ref.fa                 Reference FASTA. No --reference flag is required.\n"
         << "  10000                  Genomic bin size. No --bin-size flag is required.\n\n"
@@ -282,10 +311,13 @@ void print_usage() {
         << "Read count options (choose one):\n"
         << "  -c, --coverage X       Target genome depth. Read pairs are computed as\n"
         << "                         ceil(X * reference_bases / 300) for PE150 reads.\n"
+        << "                         Long-read counts use the configured mean length.\n"
         << "      --depth X          Alias for --coverage.\n"
         << "  -p, --pairs N          Exact number of 150 bp paired-end read pairs.\n"
         << "                         Default: 100000 when --coverage is omitted.\n"
-        << "                         --coverage and --pairs cannot be used together.\n\n"
+        << "      --reads N          Exact number of Pore-C/CiFi long reads.\n"
+        << "                         Default: 10000 when --coverage is omitted.\n"
+        << "                         --coverage and exact count options cannot be combined.\n\n"
         << "Output and reproducibility:\n"
         << "  -o, --output-prefix PREFIX\n"
         << "                         Prefix for output FASTQ files. Default: sim\n"
@@ -293,9 +325,18 @@ void print_usage() {
         << "  -j, --threads N        Worker threads for read generation. Default: 1\n"
         << "                         Use 0 to auto-detect hardware threads.\n\n"
         << "Reference digestion:\n"
-        << "  -e, --enzyme-site SEQ  Restriction enzyme motif. Default: AAGCTT\n"
+        << "  -e, --enzyme-site SEQ  Restriction enzyme motif. Defaults: Hi-C AAGCTT,\n"
+        << "                         Pore-C/CiFi GATC.\n"
         << "                         Common cut offsets are recognized for HindIII (AAGCTT)\n"
         << "                         and DpnII/MboI (GATC).\n\n"
+        << "Long-read options (Pore-C/CiFi only):\n"
+        << "      --long-read-mean N Mean read length override.\n"
+        << "      --long-read-min N  Minimum read length override.\n"
+        << "      --long-read-max N  Maximum read length override.\n"
+        << "      --long-read-sigma X\n"
+        << "                         Lognormal read-length sigma override.\n"
+        << "      --long-read-qv X   Mean platform QV override.\n"
+        << "      --max-segments N   Maximum concatemer segments per read. Default: 256\n\n"
         << "Matrix and model options:\n"
         << "  -m, --matrix FILE      Sparse or dense Hi-C contact matrix. If omitted,\n"
         << "                         the empirical model linked to --species-model is used.\n"
@@ -322,7 +363,9 @@ void print_usage() {
         << "                         Applied when an empirical model is used for the full\n"
         << "                         matrix or for trans replacement.\n\n"
         << "Output:\n"
-        << "  PREFIX_R1.fastq and PREFIX_R2.fastq, always 150 bp paired-end reads.\n";
+        << "  Hi-C:  PREFIX_R1.fastq and PREFIX_R2.fastq (150 bp paired-end)\n"
+        << "  Pore-C: PREFIX_porec.fastq and PREFIX_porec_truth.tsv\n"
+        << "  CiFi:   PREFIX_cifi.fastq and PREFIX_cifi_truth.tsv\n";
 }
 
 Config parse_args(int argc, char **argv) {
@@ -338,7 +381,9 @@ Config parse_args(int argc, char **argv) {
             return argv[++i];
         };
 
-        if (arg == "--reference" || arg == "-r") {
+        if (arg == "--assay") {
+            cfg.assay = parse_assay_type(require_value(arg));
+        } else if (arg == "--reference" || arg == "-r") {
             cfg.reference_path = require_value(arg);
         } else if (arg == "--matrix" || arg == "-m") {
             cfg.matrix_path = require_value(arg);
@@ -354,13 +399,20 @@ Config parse_args(int argc, char **argv) {
             cfg.offset_path = require_value(arg);
         } else if (arg == "--enzyme-site" || arg == "-e") {
             cfg.enzyme_site = require_value(arg);
+            cfg.enzyme_site_explicit = true;
         } else if (arg == "--bin-size" || arg == "-b") {
             cfg.bin_size = std::stoull(require_value(arg));
         } else if (arg == "--read-length") {
             cfg.read_length = std::stoull(require_value(arg));
+            cfg.read_length_explicit = true;
         } else if (arg == "--pairs" || arg == "-p") {
             cfg.pair_count = std::stoull(require_value(arg));
             cfg.pair_count_explicit = true;
+            cfg.pairs_option_used = true;
+        } else if (arg == "--reads") {
+            cfg.pair_count = std::stoull(require_value(arg));
+            cfg.pair_count_explicit = true;
+            cfg.reads_option_used = true;
         } else if (arg == "--coverage" || arg == "--depth" || arg == "-c") {
             cfg.coverage_depth = std::stod(require_value(arg));
         } else if (arg == "--seed" || arg == "-s") {
@@ -372,6 +424,35 @@ Config parse_args(int argc, char **argv) {
             cfg.trans_ratio_explicit = true;
         } else if (arg == "--force-contig-reuse") {
             cfg.force_contig_reuse = true;
+        } else if (arg == "--long-read-mean") {
+            cfg.long_read_mean = std::stoull(require_value(arg));
+            cfg.long_read_options_used = true;
+            if (cfg.long_read_mean == 0) {
+                throw std::runtime_error("--long-read-mean must be positive.");
+            }
+        } else if (arg == "--long-read-min") {
+            cfg.long_read_min = std::stoull(require_value(arg));
+            cfg.long_read_options_used = true;
+            if (cfg.long_read_min == 0) {
+                throw std::runtime_error("--long-read-min must be positive.");
+            }
+        } else if (arg == "--long-read-max") {
+            cfg.long_read_max = std::stoull(require_value(arg));
+            cfg.long_read_options_used = true;
+            if (cfg.long_read_max == 0) {
+                throw std::runtime_error("--long-read-max must be positive.");
+            }
+        } else if (arg == "--long-read-sigma") {
+            cfg.long_read_sigma = std::stod(require_value(arg));
+            cfg.long_read_options_used = true;
+            cfg.long_read_sigma_explicit = true;
+        } else if (arg == "--long-read-qv") {
+            cfg.long_read_qv = std::stod(require_value(arg));
+            cfg.long_read_options_used = true;
+            cfg.long_read_qv_explicit = true;
+        } else if (arg == "--max-segments") {
+            cfg.max_concatemer_segments = std::stoull(require_value(arg));
+            cfg.long_read_options_used = true;
         } else if (arg == "--species-model" || arg == "-S") {
             cfg.species_model = require_value(arg);
         } else if (arg == "--help" || arg == "-h") {
@@ -407,26 +488,68 @@ Config parse_args(int argc, char **argv) {
     if (cfg.output_prefix.empty()) {
         throw std::runtime_error("--output-prefix must not be empty.");
     }
+    if (cfg.pairs_option_used && cfg.reads_option_used) {
+        throw std::runtime_error("Use either --pairs or --reads, not both.");
+    }
+    if (cfg.assay == AssayType::Hic && cfg.reads_option_used) {
+        throw std::runtime_error("--reads is only valid with --assay porec or cifi.");
+    }
+    if (cfg.assay != AssayType::Hic && cfg.pairs_option_used) {
+        throw std::runtime_error("--pairs is only valid with --assay hic; use --reads.");
+    }
+    if (cfg.assay != AssayType::Hic && !cfg.pair_count_explicit) {
+        cfg.pair_count = 10000;
+    }
+    if (cfg.assay != AssayType::Hic && !cfg.enzyme_site_explicit) {
+        cfg.enzyme_site = "GATC";
+    }
+    if (cfg.assay != AssayType::Hic && cfg.read_length_explicit) {
+        throw std::runtime_error(
+            "--read-length is a Hi-C option; use --long-read-mean for Pore-C/CiFi.");
+    }
     if (cfg.read_length == 0) {
         throw std::runtime_error("--read-length must be positive.");
     }
-    if (cfg.read_length != 150) {
+    if (cfg.assay == AssayType::Hic && cfg.read_length != 150) {
         throw std::runtime_error("Only 150 bp paired-end reads are supported.");
     }
-    if (cfg.coverage_depth < 0.0) {
+    if (!std::isfinite(cfg.coverage_depth) || cfg.coverage_depth < 0.0) {
         throw std::runtime_error("--coverage must be non-negative.");
     }
     if (cfg.coverage_depth > 0.0 && cfg.pair_count_explicit) {
-        throw std::runtime_error("Use either --coverage or --pairs, not both.");
+        throw std::runtime_error("Use --coverage or an exact --pairs/--reads count, not both.");
     }
     if (cfg.coverage_depth == 0.0 && cfg.pair_count == 0) {
-        throw std::runtime_error("--pairs must be positive when --coverage is omitted.");
+        throw std::runtime_error("--pairs/--reads must be positive when --coverage is omitted.");
     }
     if (cfg.thread_count == 0) {
         cfg.thread_count = std::max<unsigned int>(1, std::thread::hardware_concurrency());
     }
-    if (cfg.trans_ratio < 0.0 || cfg.trans_ratio > 1.0) {
+    if (!std::isfinite(cfg.trans_ratio) || cfg.trans_ratio < 0.0 || cfg.trans_ratio > 1.0) {
         throw std::runtime_error("--trans-ratio must be within [0, 1].");
+    }
+    if (cfg.assay == AssayType::Hic && cfg.long_read_options_used) {
+        throw std::runtime_error("Long-read options require --assay porec or cifi.");
+    }
+    if (!std::isfinite(cfg.long_read_sigma) || cfg.long_read_sigma < 0.0 ||
+        cfg.long_read_sigma > 3.0) {
+        throw std::runtime_error("--long-read-sigma must be within [0, 3].");
+    }
+    if (!std::isfinite(cfg.long_read_qv) || cfg.long_read_qv < 0.0 ||
+        cfg.long_read_qv > 41.0) {
+        throw std::runtime_error("--long-read-qv must be within (0, 41].");
+    }
+    if (cfg.long_read_qv_explicit && cfg.long_read_qv <= 0.0) {
+        throw std::runtime_error("--long-read-qv must be within (0, 41].");
+    }
+    if (cfg.max_concatemer_segments < 2 || cfg.max_concatemer_segments > 10000) {
+        throw std::runtime_error("--max-segments must be within [2, 10000].");
+    }
+    constexpr std::size_t maximum_long_read_length = 10000000;
+    if (cfg.long_read_mean > maximum_long_read_length ||
+        cfg.long_read_min > maximum_long_read_length ||
+        cfg.long_read_max > maximum_long_read_length) {
+        throw std::runtime_error("Long-read length overrides cannot exceed 10000000 bases.");
     }
 
     return cfg;
@@ -441,14 +564,25 @@ int main(int argc, char **argv) {
         const ReferenceGenome reference = load_reference_fasta(cfg.reference_path);
         std::cerr << "Reference loaded: " << reference.contigs.size()
                   << " contigs, " << reference.total_length() << " bp\n";
-        if (cfg.read_length >= reference.total_length()) {
+        if (cfg.assay == AssayType::Hic && cfg.read_length >= reference.total_length()) {
             throw std::runtime_error("Read length must be shorter than the total reference length.");
         }
-        if (cfg.coverage_depth > 0.0) {
+        if (cfg.assay == AssayType::Hic && cfg.coverage_depth > 0.0) {
             const double requested_pairs =
                 std::ceil(cfg.coverage_depth * static_cast<double>(reference.total_length()) /
                           static_cast<double>(2 * cfg.read_length));
+            if (!std::isfinite(requested_pairs) ||
+                requested_pairs > static_cast<double>(std::numeric_limits<std::size_t>::max())) {
+                throw std::runtime_error("Requested Hi-C coverage is too large.");
+            }
             cfg.pair_count = std::max<std::size_t>(1, static_cast<std::size_t>(requested_pairs));
+        }
+
+        LongReadProfile long_read_profile;
+        if (cfg.assay == AssayType::PoreC) {
+            long_read_profile = porec_profile(cfg);
+        } else if (cfg.assay == AssayType::CiFi) {
+            long_read_profile = cifi_profile(cfg);
         }
 
         const std::size_t total_bins = reference.total_bins(cfg.bin_size);
@@ -457,9 +591,9 @@ int main(int argc, char **argv) {
         }
         std::cerr << "Global bins: " << total_bins << '\n';
         std::cerr << "Run configuration:\n"
+                  << "  assay: " << assay_type_to_string(cfg.assay) << '\n'
                   << "  output prefix: " << cfg.output_prefix << '\n'
                   << "  bin size: " << cfg.bin_size << '\n'
-                  << "  read length: " << cfg.read_length << '\n'
                   << "  enzyme site: " << cfg.enzyme_site << '\n'
                   << "  threads: " << cfg.thread_count << '\n'
                   << "  seed: " << cfg.seed << '\n'
@@ -476,16 +610,33 @@ int main(int argc, char **argv) {
         } else {
             std::cerr << cfg.trans_ratio << " (default / used only when applicable)\n";
         }
-        if (cfg.coverage_depth > 0.0) {
-            std::cerr << "  coverage: " << cfg.coverage_depth << "x\n"
-                      << "  read pairs: " << cfg.pair_count << " (derived from coverage)\n";
-        } else {
-            std::cerr << "  coverage: <none>\n"
-                      << "  read pairs: " << cfg.pair_count;
-            if (cfg.pair_count_explicit) {
-                std::cerr << " (explicit)\n";
+        if (cfg.assay == AssayType::Hic) {
+            std::cerr << "  read length: " << cfg.read_length << '\n';
+            if (cfg.coverage_depth > 0.0) {
+                std::cerr << "  coverage: " << cfg.coverage_depth << "x\n"
+                          << "  read pairs: " << cfg.pair_count << " (derived from coverage)\n";
             } else {
-                std::cerr << " (default)\n";
+                std::cerr << "  coverage: <none>\n"
+                          << "  read pairs: " << cfg.pair_count;
+                if (cfg.pair_count_explicit) {
+                    std::cerr << " (explicit)\n";
+                } else {
+                    std::cerr << " (default)\n";
+                }
+            }
+        } else {
+            std::cerr << "  long-read mean/min/max: " << long_read_profile.mean_length << '/'
+                      << long_read_profile.min_length << '/' << long_read_profile.max_length << '\n'
+                      << "  long-read lognormal sigma: " << long_read_profile.length_log_sigma << '\n'
+                      << "  long-read mean QV: " << long_read_profile.mean_qv << '\n'
+                      << "  maximum concatemer segments: " << cfg.max_concatemer_segments << '\n';
+            if (cfg.coverage_depth > 0.0) {
+                std::cerr << "  requested coverage: " << cfg.coverage_depth
+                          << "x (read count derived from mean read length)\n";
+            } else {
+                std::cerr << "  coverage: <none>\n"
+                          << "  long reads: " << cfg.pair_count
+                          << (cfg.pair_count_explicit ? " (explicit)\n" : " (default)\n");
             }
         }
 
@@ -568,21 +719,54 @@ int main(int argc, char **argv) {
                       << (matrix_stats.trans_weight / matrix_weight_total)
                       << '\n';
         }
-        std::cerr << "Streaming " << cfg.pair_count << " read pairs to FASTQ with "
-                  << cfg.thread_count << " worker thread(s)...\n";
-        PairedReadWriter writer(cfg);
-        write_hic_reads(cfg, reference, reference_offsets, matrix, writer);
+        if (cfg.assay == AssayType::Hic) {
+            std::cerr << "Streaming " << cfg.pair_count << " read pairs to FASTQ with "
+                      << cfg.thread_count << " worker thread(s)...\n";
+            PairedReadWriter writer(cfg);
+            write_hic_reads(cfg, reference, reference_offsets, matrix, writer);
 
-        std::cout << "Contigs: " << reference.contigs.size() << '\n'
-                  << "Reference length: " << reference.total_length() << '\n'
-                  << "Global bins: " << total_bins << '\n'
-                  << "Contacts loaded: " << matrix.contacts.size() << '\n'
-                  << "Read pairs: " << writer.count() << '\n'
-                  << "Coverage: " << (static_cast<double>(writer.count() * 2 * cfg.read_length) /
-                                      static_cast<double>(reference.total_length())) << "x\n"
-                  << "Read length: " << cfg.read_length << '\n'
-                  << "Output FASTQ R1: " << writer.read1_path() << '\n'
-                  << "Output FASTQ R2: " << writer.read2_path() << '\n';
+            std::cout << "Assay: hic\n"
+                      << "Contigs: " << reference.contigs.size() << '\n'
+                      << "Reference length: " << reference.total_length() << '\n'
+                      << "Global bins: " << total_bins << '\n'
+                      << "Contacts loaded: " << matrix.contacts.size() << '\n'
+                      << "Read pairs: " << writer.count() << '\n'
+                      << "Coverage: "
+                      << (static_cast<double>(writer.count() * 2 * cfg.read_length) /
+                          static_cast<double>(reference.total_length())) << "x\n"
+                      << "Read length: " << cfg.read_length << '\n'
+                      << "Output FASTQ R1: " << writer.read1_path() << '\n'
+                      << "Output FASTQ R2: " << writer.read2_path() << '\n';
+        } else {
+            const LongReadSimulationResult result =
+                cfg.assay == AssayType::PoreC
+                    ? write_porec_reads(cfg, reference, reference_offsets, matrix)
+                    : write_cifi_reads(cfg, reference, reference_offsets, matrix);
+            const double actual_coverage =
+                static_cast<double>(result.sequenced_bases) /
+                static_cast<double>(reference.total_length());
+            const double mean_read_length =
+                result.read_count == 0
+                    ? 0.0
+                    : static_cast<double>(result.sequenced_bases) / result.read_count;
+            const double mean_segments =
+                result.read_count == 0
+                    ? 0.0
+                    : static_cast<double>(result.concatemer_segments) / result.read_count;
+            std::cout << "Assay: " << assay_type_to_string(cfg.assay) << '\n'
+                      << "Contigs: " << reference.contigs.size() << '\n'
+                      << "Reference length: " << reference.total_length() << '\n'
+                      << "Global bins: " << total_bins << '\n'
+                      << "Contacts loaded: " << matrix.contacts.size() << '\n'
+                      << "Long reads: " << result.read_count << '\n'
+                      << "Sequenced bases: " << result.sequenced_bases << '\n'
+                      << "Coverage: " << actual_coverage << "x\n"
+                      << "Mean read length: " << mean_read_length << '\n'
+                      << "Mean concatemer segments: " << mean_segments << '\n'
+                      << "Segment-limited reads: " << result.segment_limited_reads << '\n'
+                      << "Output FASTQ: " << result.fastq_path << '\n'
+                      << "Output truth TSV: " << result.truth_path << '\n';
+        }
     } catch (const std::exception &ex) {
         std::cerr << "Error: " << ex.what() << '\n';
         print_usage();

@@ -1,6 +1,6 @@
 # hicreate
 
-`hicreate` is a small C++ command-line program for generating 150 bp paired-end Hi-C reads from a reference genome and an optional contact matrix.
+`hicreate` is a C++ command-line simulator for Hi-C, Pore-C, and CiFi chromosome-conformation reads from a reference genome and an optional contact matrix. Hi-C output is 150 bp paired-end Illumina-like FASTQ. Pore-C and CiFi output single-molecule, multi-fragment concatemer FASTQ plus segment-level truth tables.
 
 The current workflow is:
 
@@ -9,8 +9,8 @@ The current workflow is:
 3. Read an optional offset file that maps matrix bins back to source contigs.
 4. Perform an in silico restriction digest.
 5. Sample fragment-fragment ligation events according to matrix contact frequencies.
-6. Build the two ends of each virtual ligation molecule from restriction-fragment coordinates.
-7. Write paired FASTQ files with built-in Illumina-like quality and substitution errors.
+6. For Hi-C, build the two ends of each virtual ligation molecule and write paired Illumina-like reads.
+7. For Pore-C or CiFi, extend a multi-contact concatemer around a matrix-sampled anchor and write platform-specific long reads.
 
 ## Build
 
@@ -37,10 +37,11 @@ Outputs:
 
 ```text
 hicreate ref.fa 1000 \
+         [--assay hic|porec|cifi] \
          [--matrix matrix.tsv] \
          [--matrix-format auto|sparse|dense|binary] \
          [--empirical-model human_cell_40mb] [--model-dir models] \
-         [--coverage X | --pairs 100000] [--output-prefix sim] \
+         [--coverage X | --pairs 100000 | --reads 10000] [--output-prefix sim] \
          [--offset offset.tsv] [--enzyme-site AAGCTT] [--seed 42] [--threads 4] \
          [--trans-ratio 0.12] [--force-contig-reuse] [--species-model auto]
 ```
@@ -58,20 +59,31 @@ hicreate --reference ref.fa --bin-size 1000 [options]
 
 Optional arguments:
 
+- `--assay`: output assay, one of `hic`, `porec`, or `cifi`; default `hic`
 - `-m`, `--matrix`: input Hi-C matrix. If omitted, `hicreate` uses the empirical model linked to `--species-model`
 - `--matrix-format`: matrix parser mode (`auto`, `sparse`, `dense`, `binary`), default `auto`
 - `--empirical-model`, `--model`: empirical matrix model name or manifest path. Without `--matrix`, use the model as the full matrix. With `--matrix`, preserve input cis contacts and replace input trans contacts with the model's remapped trans contacts. If omitted, the input matrix is used as-is.
 - `--model-dir`: empirical model directory, default `models`
 - `-S`, `--species-model`: empirical preset selector. Default `auto`; currently `auto`, `human`, `homo_sapiens`, `mammal`, and `chm13` resolve to `human_cell_40mb` unless `--empirical-model` is provided
 - `-f`, `--offset`: contig-to-global-bin mapping file
-- `-c`, `--coverage`: target read depth over the reference genome; pairs are computed as `ceil(coverage * reference_bases / 300)`
+- `-c`, `--coverage`: target depth; Hi-C pairs use `ceil(coverage * reference_bases / 300)`, while long-read counts use the configured mean read length
 - `-p`, `--pairs`: number of 150 bp paired-end read pairs to write, default `100000` when `--coverage` is omitted
+- `--reads`: number of single-molecule Pore-C or CiFi reads, default `10000` when `--coverage` is omitted
 - `-o`, `--output-prefix`: prefix for output files, default `sim`
-- `-e`, `--enzyme-site`: restriction enzyme motif, default `AAGCTT`
+- `-e`, `--enzyme-site`: restriction enzyme motif; defaults are `AAGCTT` for Hi-C and `GATC` for Pore-C/CiFi
 - `-s`, `--seed`: random seed
 - `-j`, `--threads`: worker threads for read generation, default `1`; use `0` to auto-detect hardware threads
 - `-t`, `--trans-ratio`: target fraction of trans-chromosomal interaction mass. This rescales existing empirical trans contacts when an empirical model is in use
 - `--force-contig-reuse`: allow an offset with fewer source contigs than the reference. Reused-target trans blocks are synthesized from real source trans blocks and the final trans mass is normalized
+
+Long-read-only arguments:
+
+- `--long-read-mean`, `--long-read-min`, `--long-read-max`: override the assay read-length distribution
+- `--long-read-sigma`: override the lognormal read-length sigma
+- `--long-read-qv`: override mean long-read Phred QV
+- `--max-segments`: maximum restriction-fragment segments in one concatemer, default `256`; the program warns if this limit truncates sampled molecules
+
+Pore-C defaults are mean/min/max lengths of 10,000/3,000/100,000 bp, lognormal sigma 0.8, and mean QV 13 with Nanopore-like substitution, deletion, and insertion errors. CiFi defaults are 9,350/5,000/25,000 bp, sigma 0.65, mean QV 38, HiFi-like errors, and a 1.8% PCR-template duplicate rate.
 
 ## Input Files
 
@@ -164,15 +176,36 @@ Linux:
   -p 1000 -o data/sim
 ```
 
+Pore-C with DpnII digestion:
+
+```bash
+./hicreate ref.fa 1000 --assay porec -m matrix.tsv -f offset.tsv \
+  --enzyme-site GATC --reads 10000 -j 8 -o porec_sim
+```
+
+CiFi with a target depth:
+
+```bash
+./hicreate ref.fa 1000 --assay cifi -m matrix.tsv -f offset.tsv \
+  --enzyme-site GATC --coverage 5 -j 8 -o cifi_sim
+```
+
 ## Output
 
-Main output:
+Hi-C output:
 
 - `<prefix>_R1.fastq`: first reads
 - `<prefix>_R2.fastq`: second reads
 
-`--pairs` is the exact number of records written to each FASTQ file.
-If `--coverage` is provided, it replaces `--pairs` and computes the FASTQ record count from the reference size. `--coverage` and `--pairs` are mutually exclusive; using both is an error. There is no default 30x coverage unless you explicitly pass `--coverage 30`.
+Pore-C/CiFi output:
+
+- `<prefix>_porec.fastq` or `<prefix>_cifi.fastq`: single-end concatemer reads
+- `<prefix>_porec_truth.tsv` or `<prefix>_cifi_truth.tsv`: one row per source segment with contig coordinates, strand, matrix bin, and template coordinates
+
+`--pairs` is the exact number of records written to each Hi-C FASTQ file.
+If `--coverage` is provided, it replaces the assay's exact count option and computes the FASTQ record count from the reference size. `--coverage` cannot be combined with `--pairs` or `--reads`. There is no default 30x coverage unless you explicitly pass `--coverage 30`.
+
+For Pore-C/CiFi, `--reads` is the exact FASTQ record count. Long-read coverage converts requested bases to a read count using the configured mean read length; because sampled lengths and sequencing indels vary, the final measured coverage can differ slightly and is reported at completion.
 
 ## Simulation Notes
 
@@ -195,7 +228,17 @@ If `--coverage` is provided, it replaces `--pairs` and computes the FASTQ record
 - Read pairs are generated in bounded FASTQ blocks and streamed to disk, so memory does not scale with `--pairs` or `--coverage`.
 - `--threads` parallelizes read-pair sampling, template construction, quality simulation, and FASTQ block formatting; a single writer preserves ordered output and avoids file-write lock contention.
 - FASTQ qualities use an Illumina-like positional profile: high Q values near the start of each read, gradually lower Q values toward the 3' end, and Phred-derived substitution error probabilities.
-- Only 150 bp paired-end output is currently supported.
+- Hi-C remains fixed at 150 bp paired-end output. Its fragment sampling and Illumina error implementation are separate from the new long-read modules.
+- Pore-C and CiFi begin with one contact sampled exactly from the pairwise matrix. Additional segments are sampled from contact distributions conditioned on the first anchor bin. This anchor model avoids a trans contact turning into an artificial chromosome-scale random walk.
+- A pairwise matrix does not uniquely determine a higher-order joint contact distribution. Consequently, all-vs-all pairs recovered from simulated concatemers should be close to, but are not mathematically guaranteed to reproduce, every input matrix weight exactly. Use the truth TSV to evaluate or recalibrate a downstream deconcatenation workflow.
+- Segment orientation and restriction-fragment choice are random. Long-read sequences contain explicit ligation junctions and platform-specific substitutions and indels.
+- CiFi template duplication models PCR amplification; independent HiFi sequencing errors are added to each duplicate copy.
+
+## Protocol Basis
+
+The Pore-C implementation follows the assay structure described by Deshpande et al., *Nanopore sequencing of DNA concatemers reveals higher-order features of chromatin structure* ([doi:10.1101/833590](https://doi.org/10.1101/833590)), and the size-selection/sequencing details reported for high-throughput Pore-C ([doi:10.1038/s41467-023-36899-x](https://doi.org/10.1038/s41467-023-36899-x)). These workflows crosslink chromatin, digest and proximity-ligate fragments, size-select multi-fragment DNA, and sequence individual concatemers with Oxford Nanopore.
+
+The CiFi profile follows McGinty et al., *CiFi: accurate long-read chromosome conformation capture with low-input requirements* ([doi:10.1038/s41467-025-66918-y](https://doi.org/10.1038/s41467-025-66918-y)) and its library protocol ([doi:10.17504/protocols.io.4r3l21zxpg1y/v1](https://doi.org/10.17504/protocols.io.4r3l21zxpg1y/v1)). CiFi adds high-fidelity PCR enrichment, SMRTbell preparation, >5 kb size selection, and PacBio CCS/HiFi sequencing. The publication reports approximately 9.35 kb mean HiFi reads, median QV 38, and enzyme-dependent segment counts (DpnII median 17; HindIII median 2).
 
 ## Included Example Data
 
